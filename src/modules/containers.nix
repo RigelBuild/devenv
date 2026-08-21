@@ -49,12 +49,17 @@ let
   # must be a writable directory or the step dies `$HOME/.netrc: No such file or
   # directory`. The old `/env` was a read-only nix-store phantom (never created
   # real, since projects push content via explicit layers with an empty
-  # copyToRoot), so netrc-into-every-step broke CI (RIG-2368). `/tmp/home` is
-  # baked real + uid-1000-owned by mkTmp + the perms block below, under the
-  # world-writable /tmp. This single change fixes BOTH step classes: passwd-
-  # resolving tools (pulumi reads $HOME from passwd, not a per-step override) and
-  # the serialized `Env HOME` that command/gate steps inherit.
-  homeDir = "/tmp/home";
+  # copyToRoot), so netrc-into-every-step broke CI (RIG-2368). `/home/user` is
+  # baked real + uid-1000-owned at mode 0700 by mkHomeDir + the perms block
+  # below. It is deliberately NOT under /tmp: /tmp is the path a container
+  # runtime is most likely to mount over (a tmpfs/scratch volume at container
+  # start), which would shadow a baked /tmp/home and recur this bug; a dedicated
+  # /home/user has no such shadow. 0700 (not 0755) keeps $HOME/.netrc — git +
+  # pulumi credentials — unreadable by any other uid in the container. This one
+  # change fixes BOTH step classes: passwd-resolving tools (pulumi reads $HOME
+  # from passwd, not a per-step override) and the serialized `Env HOME` that
+  # command/gate steps inherit.
+  homeDir = "/home/user";
 
   mkHome = path: (pkgs.runCommand "devenv-container-home" { } ''
     mkdir -p $out${homeDir}
@@ -82,13 +87,19 @@ let
     else [ cfg.copyToRoot ]
   );
 
-  # Bake /tmp (the world-writable scratch root) AND /tmp/home (the container's
-  # HOME, see homeDir above). Both are created here so they exist as real image
-  # directories; the perms block on mkDerivation sets /tmp to 1777 (root) and
-  # /tmp/home to uid-1000 ownership so the container user can write into its home
-  # (e.g. the woodpecker netrc preamble's `$HOME/.netrc`) with no runtime mkdir.
+  # The world-writable scratch root. Kept root-owned 1777 by the perms block on
+  # mkDerivation (sticky, so any uid can create scratch but not clobber another's).
   mkTmp = (pkgs.runCommand "devenv-container-tmp" { } ''
-    mkdir -p $out/tmp/home
+    mkdir -p $out/tmp
+  '');
+
+  # The container's writable HOME (homeDir = /home/user). Baked as a real image
+  # directory here so $HOME exists with no runtime mkdir; the perms block on
+  # mkDerivation sets it uid-1000-owned at 0700 so the container user (and only
+  # it) can write `$HOME/.netrc` etc. Not under /tmp — see homeDir above for why
+  # a /tmp-based home is shadow-prone.
+  mkHomeDir = (pkgs.runCommand "devenv-container-home-dir" { } ''
+    mkdir -p $out${homeDir}
   '');
 
   mkEtc = (pkgs.runCommand "devenv-container-etc" { } ''
@@ -147,6 +158,7 @@ let
       })
       mkEtc
       mkTmp
+      mkHomeDir
     ];
 
     maxLayers = cfg.maxLayers;
@@ -175,18 +187,17 @@ let
         uname = "root";
         gname = "root";
       }
-      # /tmp/home is the container HOME (homeDir). nix2container applies perms
-      # entries in order with last-match-wins on an unanchored regex substring
-      # match (nix/tar.go), and the `/tmp` regex above also matches the
-      # `/tmp/home` path — so this entry MUST follow it to win. It flips
-      # /tmp/home from the inherited 1777/root to 0755 owned by the container
-      # user (uid/gid 1000), so the user owns its own home and can write
-      # `$HOME/.netrc` there. `/tmp` itself keeps 1777/root (the `/tmp` regex
-      # does not match the shorter `/tmp` path against `/tmp/home`).
+      # The container HOME (homeDir = /home/user), from its own store path
+      # (mkHomeDir). Owned by the container user (uid/gid 1000) at 0700 so only
+      # the user can read/write it — $HOME holds .netrc (git + pulumi creds), so
+      # group/other get nothing. nix2container matches perms.regex as an
+      # unanchored substring against the source store path (nix/tar.go), and this
+      # entry's path is mkHomeDir (a different derivation from mkTmp), so it is
+      # scoped to /home/user alone and cannot collide with the /tmp entry above.
       {
-        path = mkTmp;
-        regex = "/tmp/home";
-        mode = "0755";
+        path = mkHomeDir;
+        regex = "/home/user";
+        mode = "0700";
         uid = lib.toInt uid;
         gid = lib.toInt gid;
         uname = user;
