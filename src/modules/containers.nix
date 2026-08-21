@@ -42,7 +42,19 @@ let
   group = "user";
   uid = "1000";
   gid = "1000";
-  homeDir = "/env";
+  # A WRITABLE home. Woodpecker's per-step agent preamble runs
+  # `cat <<EOF > $HOME/.netrc` at the top of EVERY step (before it exports its
+  # own HOME or makes its workdir) when the repo has trusted.security enabled —
+  # so $HOME, resolved from this passwd entry / the serialized OCI `Env HOME`,
+  # must be a writable directory or the step dies `$HOME/.netrc: No such file or
+  # directory`. The old `/env` was a read-only nix-store phantom (never created
+  # real, since projects push content via explicit layers with an empty
+  # copyToRoot), so netrc-into-every-step broke CI (RIG-2368). `/tmp/home` is
+  # baked real + uid-1000-owned by mkTmp + the perms block below, under the
+  # world-writable /tmp. This single change fixes BOTH step classes: passwd-
+  # resolving tools (pulumi reads $HOME from passwd, not a per-step override) and
+  # the serialized `Env HOME` that command/gate steps inherit.
+  homeDir = "/tmp/home";
 
   mkHome = path: (pkgs.runCommand "devenv-container-home" { } ''
     mkdir -p $out${homeDir}
@@ -70,8 +82,13 @@ let
     else [ cfg.copyToRoot ]
   );
 
+  # Bake /tmp (the world-writable scratch root) AND /tmp/home (the container's
+  # HOME, see homeDir above). Both are created here so they exist as real image
+  # directories; the perms block on mkDerivation sets /tmp to 1777 (root) and
+  # /tmp/home to uid-1000 ownership so the container user can write into its home
+  # (e.g. the woodpecker netrc preamble's `$HOME/.netrc`) with no runtime mkdir.
   mkTmp = (pkgs.runCommand "devenv-container-tmp" { } ''
-    mkdir -p $out/tmp
+    mkdir -p $out/tmp/home
   '');
 
   mkEtc = (pkgs.runCommand "devenv-container-etc" { } ''
@@ -157,6 +174,23 @@ let
         gid = 0;
         uname = "root";
         gname = "root";
+      }
+      # /tmp/home is the container HOME (homeDir). nix2container applies perms
+      # entries in order with last-match-wins on an unanchored regex substring
+      # match (nix/tar.go), and the `/tmp` regex above also matches the
+      # `/tmp/home` path — so this entry MUST follow it to win. It flips
+      # /tmp/home from the inherited 1777/root to 0755 owned by the container
+      # user (uid/gid 1000), so the user owns its own home and can write
+      # `$HOME/.netrc` there. `/tmp` itself keeps 1777/root (the `/tmp` regex
+      # does not match the shorter `/tmp` path against `/tmp/home`).
+      {
+        path = mkTmp;
+        regex = "/tmp/home";
+        mode = "0755";
+        uid = lib.toInt uid;
+        gid = lib.toInt gid;
+        uname = user;
+        gname = group;
       }
     ];
 
