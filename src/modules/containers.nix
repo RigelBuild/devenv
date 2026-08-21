@@ -95,11 +95,16 @@ let
 
   # The container's writable HOME (homeDir = /home/user). Baked as a real image
   # directory here so $HOME exists with no runtime mkdir; the perms block on
-  # mkDerivation sets it uid-1000-owned at 0700 so the container user (and only
-  # it) can write `$HOME/.netrc` etc. Not under /tmp — see homeDir above for why
-  # a /tmp-based home is shadow-prone.
+  # mkDerivation sets homeDir itself uid-1000-owned at 0700 so the container user
+  # (and only it) can write `$HOME/.netrc` etc. Not under /tmp — see homeDir
+  # above for why a /tmp-based home is shadow-prone. The intermediate parent
+  # `/home` is chmod'd 0755 explicitly (not left to the build umask) so it is
+  # deterministically world-traversable: uid-1000 must be able to traverse /home
+  # to reach its 0700 home, and `/home` gets no perms entry (the regex matches
+  # only /home/user), so its mode is whatever this derivation bakes.
   mkHomeDir = (pkgs.runCommand "devenv-container-home-dir" { } ''
     mkdir -p $out${homeDir}
+    chmod 0755 $out/home
   '');
 
   mkEtc = (pkgs.runCommand "devenv-container-etc" { } ''
@@ -158,6 +163,14 @@ let
       })
       mkEtc
       mkTmp
+      # For a consumer with a non-empty copyToRoot, homeDir (/home/user) is also
+      # baked by the project home layer (mkHome, 0744 uid-1000, project contents).
+      # Both land the same dir in different layers; the customizationLayer is
+      # assembled LAST (nix2container default.nix), so mkHomeDir's 0700 dir mode
+      # is authoritative while the project contents underneath survive at 0744.
+      # orion's CI images pass copyToRoot=[] so mkHome never runs and only this
+      # empty 0700 home exists — but the 0700 mode's authority relies on that
+      # layer ordering for any default consumer.
       mkHomeDir
     ];
 
