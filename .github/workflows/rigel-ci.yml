@@ -1,0 +1,26 @@
+name: CI
+
+# Branch-protection gate producing a check-run literally named `CI` for the
+# fork's `main` ruleset to pin (RIG-2213). Upstream's own pipeline runs on
+# self-hosted runners this fork does not have, so a `needs:`-aggregator over it
+# would sit `queued` forever and wedge the pin. This standalone job runs the
+# same build command upstream's build.yml runs (`nix build .#devenv`) on a
+# GitHub-hosted runner, pulling the closure from the devenv cachix substituter
+# the flake already declares, so it is a real gate that can go green here.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  CI:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+      - run: nix build -L --show-trace .#devenv
