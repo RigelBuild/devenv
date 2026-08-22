@@ -5,14 +5,21 @@ name: CI
 # self-hosted runners this fork does not have, so a `needs:`-aggregator over it
 # would sit `queued` forever and wedge the pin. This standalone job runs the
 # same build command upstream's build.yml runs (`nix build .#devenv`) on a
-# GitHub-hosted runner, pulling the closure from the devenv cachix substituter
-# the flake already declares, so it is a real gate that can go green here.
+# GitHub-hosted runner. The devenv substituter is wired explicitly via
+# cachix-action (matching upstream build.yml) rather than the flake's
+# `nixConfig.extra-substituters`, which nix ignores non-interactively without
+# `--accept-flake-config`; without it the build would cold-compile the custom
+# Nix fork + full closure from source and risk exhausting the hosted runner.
 
 on:
   pull_request:
   push:
     branches:
       - main
+
+concurrency:
+  group: rigel-ci-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -23,4 +30,11 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+      # Pull-only: no authToken (we do not push to upstream's cache from the
+      # fork's PR gate). Names the devenv substituter so the closure — notably
+      # the custom Nix fork `github:cachix/nix/devenv-2.35` and nixd, which are
+      # not on cache.nixos.org — is fetched, not rebuilt.
+      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+        with:
+          name: devenv
       - run: nix build -L --show-trace .#devenv
