@@ -2813,7 +2813,59 @@ null
 
 
 
+## containers.\<name>.group
+
+Unix group name baked into the container’s group entry. The gid stays 1000.
+
+
+
+*Type:*
+string
+
+
+
+*Default:*
+
+```nix
+"user"
+```
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/containers.nix](https://github.com/cachix/devenv/blob/main/src/modules/containers.nix)
+
+
+
+## containers.\<name>.homeDir
+
+
+
+The container user’s ` $HOME `: its passwd home field, the ` HOME ` in the
+image config, the staged (and uid-owned) home directory, and the
+default ` workingDir `. Set this when the image must match a home path
+an external supervisor execs with — a mismatch makes nix, direnv and
+devenv fall back to the passwd home (“$HOME is not owned by you”).
+
+
+
+*Type:*
+string
+
+
+
+*Default:*
+
+```nix
+"/home/user"
+```
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/containers.nix](https://github.com/cachix/devenv/blob/main/src/modules/containers.nix)
+
+
+
 ## containers.\<name>.isBuilding
+
+
 
 Set to true when the environment is building this container.
 
@@ -3315,6 +3367,33 @@ null
 
 
 
+## containers.\<name>.user
+
+
+
+Unix user name baked into the container’s passwd/shadow entry, its
+image config ` User `, and ` $USER `. The uid stays 1000 regardless — it is
+what nix2container’s ` nixUid ` and the initialized Nix DB are built
+around — so this renames the account, it does not renumber it.
+
+
+
+*Type:*
+string
+
+
+
+*Default:*
+
+```nix
+"user"
+```
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/containers.nix](https://github.com/cachix/devenv/blob/main/src/modules/containers.nix)
+
+
+
 ## containers.\<name>.version
 
 
@@ -3355,7 +3434,7 @@ string
 *Default:*
 
 ```nix
-"/env"
+"/home/user"
 ```
 
 *Declared by:*
@@ -6017,8 +6096,6 @@ string
 
 ## git-hooks.hooks.autoflake
 
-
-
 autoflake hook
 
 
@@ -6081,6 +6158,8 @@ null or string
 
 
 ## git-hooks.hooks.autoflake.settings.flags
+
+
 
 Flags passed to autoflake.
 
@@ -8291,8 +8370,6 @@ null
 
 ## git-hooks.hooks.hpack
 
-
-
 hpack hook
 
 
@@ -8354,6 +8431,8 @@ false
 
 
 ## git-hooks.hooks.isort
+
+
 
 isort hook
 
