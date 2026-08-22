@@ -27,6 +27,15 @@ concurrency:
 jobs:
   pipeline:
     name: pipeline (${{ matrix.system }})
+    # RigelBuild fork: this matrix runs on upstream Cachix's self-hosted
+    # runners (warm nix store + native Apple Silicon), which RigelBuild has
+    # no runners registered for — so on the fork every leg sits `queued`
+    # forever. The fork's real PR build gate is the standalone rigel-ci.yml
+    # `CI` producer (`nix build .#devenv` on a GitHub-hosted runner), which is
+    # also the branch-protection pin target. Scope this inherited matrix to
+    # the upstream owner so it skips cleanly on the fork rather than hanging.
+    # (The richer multi-arch build + cache-push gate is RIG-2449.) (RIG-2213)
+    if: github.repository_owner == 'cachix'
 
     strategy:
       fail-fast: false
