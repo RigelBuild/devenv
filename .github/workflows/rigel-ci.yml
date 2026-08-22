@@ -27,6 +27,9 @@ permissions:
 jobs:
   CI:
     runs-on: ubuntu-latest
+    # Fail fast if a substituter regression forces a cold rebuild of the
+    # closure, rather than hanging to the 6h job default on the pinned check.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
