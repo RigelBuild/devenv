@@ -88,6 +88,7 @@ otlp-http-protobuf = ["otlp", "opentelemetry-otlp/http-proto"]
 otlp-http-json = ["otlp", "opentelemetry-otlp/http-json"]
 test-all = [
   "test-mcp",
+  "test-secretspec",
   "devenv-processes/test-all",
   "devenv-nix-backend/test-all",
   "devenv-reload/test-all",
@@ -95,4 +96,9 @@ test-all = [
   "devenv-tui/test-all",
 ]
 test-mcp = []
+# Gates the secretspec activation-reason regression guard (RIG-2828); it drives
+# process-global cwd/env, serialized by the crate-wide TEST_ENV_LOCK
+# (devenv/src/lib.rs) — see the guard in devenv/src/devenv/mod.rs. Kept out of
+# the default run for cost, not soundness.
+test-secretspec = []
 snix = ["dep:devenv-snix-backend", "devenv-core/snix"]

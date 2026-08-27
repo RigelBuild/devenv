@@ -1187,9 +1187,7 @@ pub enum InputsCommand {
 mod tests {
     use super::*;
     use clap::{Parser, crate_version};
-    use std::sync::{Mutex, MutexGuard};
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use std::sync::MutexGuard;
 
     struct EnvVarGuard {
         _lock: MutexGuard<'static, ()>,
@@ -1198,7 +1196,7 @@ mod tests {
 
     impl EnvVarGuard {
         fn new(vars: &[&'static str]) -> Self {
-            let lock = ENV_LOCK.lock().unwrap();
+            let lock = crate::TEST_ENV_LOCK.lock().unwrap();
             let saved = vars
                 .iter()
                 .map(|&var| (var.to_owned(), env::var(var).ok()))
