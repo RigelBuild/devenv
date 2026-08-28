@@ -3700,7 +3700,19 @@ fn resolve_secretspec_into(
         secrets.set_profile(profile_str);
     }
 
-    let validated_secrets = match secrets.validate()? {
+    // secretspec 0.19+ gates every access behind a `require_reason` policy that
+    // defaults to `"agents"`: when the caller is detected as a coding agent and no
+    // reason is supplied, validate() fails with ReasonRequired regardless of
+    // `required=false`. Shell activation is automatic (no interactive `secretspec
+    // get`), so supply a default reason describing it. with_default_reason only
+    // fills an ABSENT reason — an explicit SECRETSPEC_REASON / with_reason still
+    // wins and is what gets audited. (The other resolve path,
+    // resolve_builtin_cachix_auth_token, uses a manifest with require_reason=false
+    // and so needs no reason.)
+    let validated_secrets = match secrets
+        .with_default_reason("devenv shell activation")
+        .validate()?
+    {
         Ok(validated) => validated,
         Err(e) => {
             return Err(SecretsNeedPrompting {
