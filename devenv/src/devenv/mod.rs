@@ -4509,4 +4509,203 @@ mod tests {
             vec![("CONFIG".to_string(), "key=value=extra".to_string())]
         );
     }
+
+    // The secretspec activation-reason regression guard (RIG-2828). It pins the
+    // RIG-2822 fix: `resolve_secretspec_into` chains
+    // `.with_default_reason("devenv shell activation")` before `.validate()?` so
+    // secretspec 0.19+'s `require_reason="agents"` policy stops blocking a coding
+    // agent's automatic devenv-shell entry. Remove that chain and this test goes
+    // red: an agent with no reason hits `SecretSpecError::ReasonRequired`, which
+    // `validate()?` propagates as the outer `Err`.
+    //
+    // The test drives real process-global state — cwd (because
+    // `secretspec::Secrets::load()` walks up from the current directory) and a set
+    // of env vars (agent detection, the reason/profile/provider/scope overrides,
+    // and the XDG dirs that steer secretspec's user-config + audit sinks). That
+    // mutation is `unsafe` under edition 2024, and std's contract requires no
+    // other thread read or write the environment concurrently — but the default
+    // libtest harness runs this crate's tests multi-threaded in ONE binary
+    // alongside `cli::tests`, which also mutates env. So the guard holds the
+    // crate-wide `TEST_ENV_LOCK` (which `cli::tests::EnvVarGuard` also takes), not
+    // a per-module mutex that would only serialize within this module. The
+    // `test-secretspec` feature gates the test out of the default run for its
+    // cost/global-state, not for soundness — the lock, not the runner, is what
+    // makes it safe.
+    //
+    // A single env mutation the guard will apply: set a value, or clear the var.
+    #[cfg(feature = "test-secretspec")]
+    enum EnvOp {
+        Set(&'static str, std::ffi::OsString),
+        Clear(&'static str),
+    }
+
+    // Enters an isolated world for a secretspec resolve: holds `TEST_ENV_LOCK`,
+    // chdirs into `cwd`, and applies a batch of env set/clear ops — snapshotting
+    // every touched global first so Drop restores it (and releases the lock),
+    // even on a panic in the test body.
+    #[cfg(feature = "test-secretspec")]
+    struct ProcessGlobalGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        cwd: std::path::PathBuf,
+        restore: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    #[cfg(feature = "test-secretspec")]
+    impl ProcessGlobalGuard {
+        fn enter(cwd: &std::path::Path, ops: Vec<EnvOp>) -> Self {
+            let lock = crate::TEST_ENV_LOCK.lock().unwrap();
+            let prev_cwd = std::env::current_dir().expect("capture current dir");
+            let restore = ops
+                .iter()
+                .map(|op| {
+                    let name = match op {
+                        EnvOp::Set(name, _) | EnvOp::Clear(name) => *name,
+                    };
+                    (name, std::env::var_os(name))
+                })
+                .collect();
+            // Construct the guard BEFORE any mutation so Drop owns restoration
+            // from the first `set_var` onward — a panic in the op loop or the
+            // chdir below then unwinds through Drop and restores cwd + env,
+            // instead of leaking a corrupted environment to the next test.
+            let guard = Self {
+                _lock: lock,
+                cwd: prev_cwd,
+                restore,
+            };
+            // SAFETY: `guard` holds TEST_ENV_LOCK for the lifetime of these
+            // mutations, serializing every process-wide cwd/env change across the
+            // crate's tests; the snapshot is restored by `guard`'s Drop before the
+            // lock is released.
+            for op in &ops {
+                match op {
+                    EnvOp::Set(name, value) => unsafe { std::env::set_var(name, value) },
+                    EnvOp::Clear(name) => unsafe { std::env::remove_var(name) },
+                }
+            }
+            std::env::set_current_dir(cwd).expect("enter isolated cwd");
+            guard
+        }
+    }
+
+    #[cfg(feature = "test-secretspec")]
+    impl Drop for ProcessGlobalGuard {
+        fn drop(&mut self) {
+            // Surface a failed cwd restore loudly (but never panic in Drop — a
+            // double-panic aborts): otherwise every later test in the binary runs
+            // from the deleted tempdir and fails as a confusing, unrelated cascade.
+            if let Err(e) = std::env::set_current_dir(&self.cwd) {
+                eprintln!(
+                    "ProcessGlobalGuard: failed to restore cwd to {}: {e}",
+                    self.cwd.display()
+                );
+            }
+            // SAFETY: see `enter` — restoration runs while TEST_ENV_LOCK is still
+            // held, including during unwinding.
+            for (name, value) in &self.restore {
+                match value {
+                    Some(v) => unsafe { std::env::set_var(name, v) },
+                    None => unsafe { std::env::remove_var(name) },
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "test-secretspec")]
+    fn agent_shell_entry_supplies_a_default_secretspec_reason() {
+        use std::fs;
+
+        let project = tempfile::tempdir().expect("create project root");
+        // A `default` profile must declare at least one secret (an empty profile
+        // fails config load), and a `dotenv` provider supplies it so resolution
+        // succeeds once the reason gate is cleared — isolating the gate as the
+        // only thing this test can trip. `require_reason` is left unset so it
+        // defaults to "agents": the exact policy the RIG-2822 fix defuses.
+        fs::write(
+            project.path().join("secretspec.toml"),
+            indoc::indoc! {r#"
+                [project]
+                name = "devenv-rig2828-fixture"
+                revision = "1.0"
+
+                [profiles.default]
+                DEVENV_RIG2828_SECRET = { description = "regression-guard fixture secret", required = true }
+            "#},
+        )
+        .expect("write secretspec.toml");
+        fs::write(
+            project.path().join(".env"),
+            "DEVENV_RIG2828_SECRET=present\n",
+        )
+        .expect("write dotenv provider");
+
+        // Point every XDG dir + HOME at a throwaway tempdir so no user-global
+        // secretspec `config.toml` is discoverable (it could inject an audit
+        // path, a default reason, or a default profile) and the reason-gate's
+        // audit writer stays off the real `~/.local/state/secretspec/audit.log`.
+        let home = tempfile::tempdir().expect("create home dir");
+        let home_os = home.path().as_os_str().to_owned();
+        let ops = vec![
+            // Detected as a coding agent -> `require_reason="agents"` engages.
+            EnvOp::Set("CLAUDECODE", "1".into()),
+            EnvOp::Set("HOME", home_os.clone()),
+            EnvOp::Set("XDG_STATE_HOME", home_os.clone()),
+            EnvOp::Set("XDG_CONFIG_HOME", home_os.clone()),
+            EnvOp::Set("XDG_DATA_HOME", home_os),
+            // Clear every ambient input that would otherwise make the fixture not
+            // the sole input: an ambient reason (or the SECRETSPEC_AGENT opt-in)
+            // would satisfy the gate WITH THE FIX REMOVED, making the guard
+            // vacuous; an ambient profile/provider/scope would fail the resolve
+            // for an unrelated reason and blame the gate.
+            EnvOp::Clear("SECRETSPEC_REASON"),
+            EnvOp::Clear("SECRETSPEC_AGENT"),
+            EnvOp::Clear("SECRETSPEC_PROFILE"),
+            EnvOp::Clear("SECRETSPEC_PROVIDER"),
+            EnvOp::Clear("SECRETSPEC_SCOPE"),
+        ];
+        let _guard = ProcessGlobalGuard::enter(project.path(), ops);
+
+        // Negative control: with no reason supplied, the require_reason gate MUST
+        // fire, or this whole test is vacuous. This fails loudly if a secretspec
+        // bump flips the default off "agents", a `detect-coding-agent` bump stops
+        // recognizing CLAUDECODE, or the guard's env clearing regresses — any of
+        // which would silently disarm the gate and leave the positive assertion
+        // below passing forever while guarding nothing.
+        assert!(
+            matches!(
+                secretspec::Secrets::load()
+                    .expect("load fixture manifest")
+                    .validate(),
+                Err(secretspec::SecretSpecError::ReasonRequired)
+            ),
+            "precondition: the require_reason gate must be armed (agent + no reason) \
+             for this regression guard to mean anything"
+        );
+
+        let settings = SecretSettings {
+            secretspec: Some(devenv_core::config::SecretspecConfig {
+                enable: true,
+                provider: Some("dotenv:.env".to_string()),
+                ..Default::default()
+            }),
+        };
+
+        // Positive assertion: with the gate armed (proven above), the
+        // `with_default_reason` chain is the only thing that lets the automatic
+        // shell entry clear the policy and resolve. Remove it -> `Err(ReasonRequired)`.
+        let mut cell: OnceCell<ResolvedSecrets> = OnceCell::new();
+        let result = resolve_secretspec_into(project.path(), &settings, &mut cell);
+
+        assert!(
+            result.is_ok(),
+            "agent shell entry must not be blocked by require_reason: {result:?}"
+        );
+        assert_eq!(
+            cell.get()
+                .and_then(|r| r.secrets.get("DEVENV_RIG2828_SECRET")),
+            Some(&"present".to_string()),
+            "the declared secret must resolve once the reason gate is satisfied"
+        );
+    }
 }

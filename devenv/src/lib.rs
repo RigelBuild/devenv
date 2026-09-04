@@ -46,3 +46,16 @@ pub use devenv_core::{
 pub fn is_development_version() -> bool {
     !matches!(env!("DEVENV_IS_RELEASE"), "true" | "1")
 }
+
+/// Process-wide serialization for tests that mutate the environment or the
+/// current working directory. Env access is process-global and edition-2024
+/// makes `set_var`/`remove_var` `unsafe`; std's contract requires that no other
+/// thread reads or writes the environment concurrently. The default libtest
+/// harness runs this lib target's tests multi-threaded in ONE binary, so every
+/// test guard in the lib crate that touches env/cwd MUST take this ONE lock — a
+/// per-module mutex only serializes within its own module and races the others.
+/// (The `devenv` bin target is a separate test binary and keeps its own
+/// `PROCESS_STATE_LOCK`.) Held for a guard's lifetime and released after it
+/// restores the state it changed.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
