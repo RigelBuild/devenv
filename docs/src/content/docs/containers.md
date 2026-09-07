@@ -177,6 +177,38 @@ You can also specify these options declaratively:
 
 See this [fly.io example](https://github.com/cachix/devenv/tree/main/examples/fly.io) for how to get started.
 
+## Setting the container user and home directory
+
+:::tip[New in version 2.3.1]
+:::
+
+Each container has its own `user`, `group` and `homeDir`. They default to
+`user`, `user` and `/home/user`, and they move together: the container's
+`passwd`, `group` and `shadow` rows, the ownership of the staged home
+directory, the image config's `User`, `HOME` and `USER`, and the default
+`workingDir`.
+
+```nix title="devenv.nix"
+{
+  containers."prod" = {
+    user = "app";
+    group = "app";
+    homeDir = "/home/app";
+    startupCommand = "/mybinary serve";
+  };
+}
+```
+
+Set these when the image has to match a home path something outside the
+container expects. If the home baked into the image and the path a supervisor
+execs with disagree, tools that resolve the home from `passwd` fall back to it
+and report that `$HOME` is not owned by you.
+
+The home directory is created in the image and owned by the container user at
+mode `0700`, so credentials written into `$HOME` are not readable by other
+users in the container. The uid and gid stay `1000` regardless of the user
+name.
+
 ## Changing the environment based on the build type
 
 If you want to provide the `openssl` package to native and container environments, but `git` only for native environments:
