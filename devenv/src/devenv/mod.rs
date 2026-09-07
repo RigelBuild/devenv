@@ -4114,7 +4114,17 @@ fn resolve_secretspec_into(
         secrets.set_profile(profile_str);
     }
 
-    let validated_secrets = match secrets.validate()? {
+    // secretspec 0.19+ gates every access behind a `require_reason` policy whose
+    // default (`"agents"`) rejects an access with no reason when the caller is
+    // detected as a coding agent — `validate()` then fails with `ReasonRequired`
+    // even for a secret declared `required = false`. Shell activation is
+    // automatic and has no interactive caller to prompt, so it must describe
+    // itself. `with_default_reason` only fills an ABSENT reason, so an explicit
+    // `SECRETSPEC_REASON` or `with_reason()` still wins and is what gets audited.
+    let validated_secrets = match secrets
+        .with_default_reason("devenv shell activation")
+        .validate()?
+    {
         Ok(validated) => validated,
         Err(e) => {
             return Err(SecretsNeedPrompting {

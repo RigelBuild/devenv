@@ -2,6 +2,10 @@
 
 ## 2.3.1 (unreleased)
 
+### Bug Fixes
+
+- Fixed `devenv shell` failing to activate when a project has a secretspec manifest and the caller is detected as a coding agent. Activation is automatic and had no reason to supply, so secretspec's `require_reason` policy rejected it with `ReasonRequired`, even when every secret was declared `required = false`. Activation now supplies a default reason, and an explicit `SECRETSPEC_REASON` still takes precedence.
+
 ## 2.3.0 (2026-09-07)
 
 ### Bug Fixes
