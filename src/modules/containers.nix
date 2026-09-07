@@ -42,7 +42,24 @@ let
   group = "user";
   uid = "1000";
   gid = "1000";
-  homeDir = "/env";
+  # A writable home. `/env` was never created as a real directory: projects push
+  # content through explicit layers and the default copyToRoot is empty, so it
+  # existed only as a read-only nix-store phantom. Anything that resolves HOME
+  # and then writes into it — a CI runner staging `$HOME/.netrc` at the top of a
+  # step, before it exports its own HOME or makes a workdir — fails with
+  # `mkdir /env: permission denied` or `No such file or directory`.
+  #
+  # Both HOME sources derive from this value: the passwd entry below and the
+  # serialized OCI `Env HOME`. That matters because some tools read the home
+  # directory from passwd rather than the environment (the Pulumi CLI, for one),
+  # so a per-invocation HOME override does not reach them.
+  #
+  # `/home/user` is baked as a real uid-1000-owned directory at mode 0700 by
+  # mkHomeDir and the perms block below; 0700 keeps credentials staged in $HOME
+  # unreadable by any other uid in the container. Deliberately not under /tmp: a
+  # container runtime is most likely to mount over /tmp with a tmpfs or scratch
+  # volume at start, which would shadow a baked /tmp/home and bring the bug back.
+  homeDir = "/home/user";
 
   mkHome = path: (pkgs.runCommand "devenv-container-home" { } ''
     mkdir -p $out${homeDir}
@@ -70,8 +87,25 @@ let
     else [ cfg.copyToRoot ]
   );
 
+  # The world-writable scratch root. Kept root-owned 1777 by the perms block on
+  # mkDerivation (sticky, so any uid can create scratch but not clobber another's).
   mkTmp = (pkgs.runCommand "devenv-container-tmp" { } ''
     mkdir -p $out/tmp
+  '');
+
+  # The container's writable HOME (homeDir = /home/user). Baked as a real image
+  # directory here so $HOME exists with no runtime mkdir; the perms block on
+  # mkDerivation sets homeDir itself uid-1000-owned at 0700 so the container user
+  # (and only it) can write into it. Not under /tmp — see homeDir above for why a
+  # /tmp-based home is shadow-prone.
+  #
+  # The intermediate `/home` matches no perms entry (the regex covers /home/user
+  # only), so its mode is whatever this output carries. Nix makes store outputs
+  # read-only, so it ships as r-xr-xr-x rather than the 0755 below — traversable
+  # by uid 1000 either way, which is what reaching a 0700 home requires.
+  mkHomeDir = (pkgs.runCommand "devenv-container-home-dir" { } ''
+    mkdir -p $out${homeDir}
+    chmod 0755 $out/home
   '');
 
   mkEtc = (pkgs.runCommand "devenv-container-etc" { } ''
@@ -130,6 +164,14 @@ let
       })
       mkEtc
       mkTmp
+      # For a consumer with a non-empty copyToRoot, homeDir (/home/user) is also
+      # baked by the project home layer (mkHome, 0744 uid-1000, project
+      # contents). Both land the same directory in different layers; the
+      # customizationLayer is assembled last, so mkHomeDir's 0700 directory mode
+      # is authoritative while the project contents underneath survive at 0744.
+      # With the default empty copyToRoot, mkHome never runs and only this empty
+      # 0700 home exists.
+      mkHomeDir
     ];
 
     maxLayers = cfg.maxLayers;
@@ -157,6 +199,22 @@ let
         gid = 0;
         uname = "root";
         gname = "root";
+      }
+      # The container HOME (homeDir = /home/user), from its own store path
+      # (mkHomeDir). Owned by the container user (uid/gid 1000) at 0700 so only
+      # that user can read or write it — $HOME is where credential files such as
+      # .netrc get staged, so group and other get nothing. nix2container matches
+      # perms.regex as an unanchored substring against the source store path, and
+      # this entry's path is mkHomeDir (a different derivation from mkTmp), so it
+      # is scoped to /home/user alone and cannot collide with the /tmp entry.
+      {
+        path = mkHomeDir;
+        regex = "/home/user";
+        mode = "0700";
+        uid = lib.toInt uid;
+        gid = lib.toInt gid;
+        uname = user;
+        gname = group;
       }
     ];
 
@@ -455,6 +513,21 @@ in
   config = lib.mkMerge [
     {
       container.isBuilding = envContainerName != "";
+
+      changelogs = [
+        {
+          date = "2026-09-07";
+          title = "The container `HOME` is now a writable `/home/user`";
+          description = ''
+            A container's home directory used to be `/env`, which was never created as a real writable directory: projects push content through explicit layers and the default `copyToRoot` is empty, so `/env` existed only as a read-only nix-store path.
+            Anything that resolved `HOME` and then wrote into it failed, for example a CI step staging `$HOME/.netrc` before creating its own working directory.
+            The home directory is now `/home/user`, baked into the image and owned by the container user at mode `0700` so credentials staged there are unreadable by other users in the container.
+            Both `HOME` sources change together: the `passwd` entry and the image's `HOME` environment variable.
+
+            If you hardcoded `/env` in a container command, reference `$HOME` instead.
+          '';
+        }
+      ];
 
       containers.shell = {
         name = lib.mkDefault "shell";
