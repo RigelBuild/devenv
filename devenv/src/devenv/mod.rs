@@ -4526,14 +4526,11 @@ mod tests {
     // other thread read or write the environment concurrently — but the default
     // libtest harness runs this crate's tests multi-threaded in ONE binary
     // alongside `cli::tests`, which also mutates env. So the guard holds the
-    // crate-wide `TEST_ENV_LOCK` (which `cli::tests::EnvVarGuard` also takes), not
-    // a per-module mutex that would only serialize within this module. The
-    // `test-secretspec` feature gates the test out of the default run for its
-    // cost/global-state, not for soundness — the lock, not the runner, is what
-    // makes it safe.
+    // crate-wide `TEST_ENV_LOCK` (which `cli::tests::EnvVarGuard` also takes).
+    // The lock serializes env/cwd *mutators* only; unlocked tests must not
+    // depend on HOME/XDG/CLAUDECODE/cwd.
     //
     // A single env mutation the guard will apply: set a value, or clear the var.
-    #[cfg(feature = "test-secretspec")]
     enum EnvOp {
         Set(&'static str, std::ffi::OsString),
         Clear(&'static str),
@@ -4543,17 +4540,17 @@ mod tests {
     // chdirs into `cwd`, and applies a batch of env set/clear ops — snapshotting
     // every touched global first so Drop restores it (and releases the lock),
     // even on a panic in the test body.
-    #[cfg(feature = "test-secretspec")]
     struct ProcessGlobalGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
         cwd: std::path::PathBuf,
         restore: Vec<(&'static str, Option<std::ffi::OsString>)>,
     }
 
-    #[cfg(feature = "test-secretspec")]
     impl ProcessGlobalGuard {
         fn enter(cwd: &std::path::Path, ops: Vec<EnvOp>) -> Self {
-            let lock = crate::TEST_ENV_LOCK.lock().unwrap();
+            let lock = crate::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let prev_cwd = std::env::current_dir().expect("capture current dir");
             let restore = ops
                 .iter()
@@ -4588,7 +4585,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "test-secretspec")]
     impl Drop for ProcessGlobalGuard {
         fn drop(&mut self) {
             // Surface a failed cwd restore loudly (but never panic in Drop — a
@@ -4612,7 +4608,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "test-secretspec")]
     fn agent_shell_entry_supplies_a_default_secretspec_reason() {
         use std::fs;
 
@@ -4654,10 +4649,11 @@ mod tests {
             EnvOp::Set("XDG_CONFIG_HOME", home_os.clone()),
             EnvOp::Set("XDG_DATA_HOME", home_os),
             // Clear every ambient input that would otherwise make the fixture not
-            // the sole input: an ambient reason (or the SECRETSPEC_AGENT opt-in)
-            // would satisfy the gate WITH THE FIX REMOVED, making the guard
-            // vacuous; an ambient profile/provider/scope would fail the resolve
-            // for an unrelated reason and blame the gate.
+            // the sole input: an ambient reason would satisfy the gate WITH THE FIX
+            // REMOVED, making the guard vacuous; an ambient profile/provider/scope
+            // would fail the resolve for an unrelated reason and blame the gate.
+            // SECRETSPEC_AGENT only arms the gate (CLAUDECODE already does); cleared
+            // for hygiene.
             EnvOp::Clear("SECRETSPEC_REASON"),
             EnvOp::Clear("SECRETSPEC_AGENT"),
             EnvOp::Clear("SECRETSPEC_PROFILE"),

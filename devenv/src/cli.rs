@@ -1196,7 +1196,9 @@ mod tests {
 
     impl EnvVarGuard {
         fn new(vars: &[&'static str]) -> Self {
-            let lock = crate::TEST_ENV_LOCK.lock().unwrap();
+            let lock = crate::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let saved = vars
                 .iter()
                 .map(|&var| (var.to_owned(), env::var(var).ok()))

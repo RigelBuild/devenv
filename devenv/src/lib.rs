@@ -52,7 +52,7 @@ pub fn is_development_version() -> bool {
 /// makes `set_var`/`remove_var` `unsafe`; std's contract requires that no other
 /// thread reads or writes the environment concurrently. The default libtest
 /// harness runs this lib target's tests multi-threaded in ONE binary, so every
-/// test guard in the lib crate that touches env/cwd MUST take this ONE lock — a
+/// test guard in the lib crate that MUTATES env/cwd must take this ONE lock — a
 /// per-module mutex only serializes within its own module and races the others.
 /// (The `devenv` bin target is a separate test binary and keeps its own
 /// `PROCESS_STATE_LOCK`.) Held for a guard's lifetime and released after it
