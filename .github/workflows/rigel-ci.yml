@@ -41,3 +41,7 @@ jobs:
         with:
           name: devenv
       - run: nix build -L --show-trace .#devenv
+      # Upstream's test matrix is owner-gated off the fork, so run the fork's own
+      # in-tree regression tests here against the CLI just built.
+      - name: Fork regression tests
+        run: PATH="$PWD/result/bin:$PATH" devenv-run-tests run tests --only container-homedir-shape
