@@ -360,13 +360,17 @@ let
       };
 
       homeDir = lib.mkOption {
-        type = types.str;
+        # Canonical absolute path only: the 0700 perms regex matches it as written, so `/`,
+        # a trailing slash, `//`, `.` or `..` would leave the real $HOME 0755.
+        type = types.strMatching ''(/([^/.][^/]*|\.[^/.][^/]*|\.\.[^/]+))+'';
         description = ''
           The container user's `$HOME`: its passwd home field, the `HOME` in the
           image config, the staged (and uid-owned) home directory, and the
           default `workingDir`. Set this when the image must match a home path
           an external supervisor execs with — a mismatch makes nix, direnv and
           devenv fall back to the passwd home ("$HOME is not owned by you").
+          Must be a canonical absolute path: not `/`, no trailing slash, and no
+          empty, `.` or `..` components.
         '';
         default = defaultHomeDir;
       };
