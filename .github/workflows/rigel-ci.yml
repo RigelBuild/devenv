@@ -1,7 +1,7 @@
 name: CI
 
 # Branch-protection gate producing a check-run literally named `CI` for the
-# fork's `main` ruleset to pin (RIG-2213). Upstream's own pipeline runs on
+# fork's `rigel-release` ruleset to pin (RIG-2213). Upstream's own pipeline runs on
 # self-hosted runners this fork does not have, so a `needs:`-aggregator over it
 # would sit `queued` forever and wedge the pin. This standalone job runs the
 # same build command upstream's build.yml runs (`nix build .#devenv`) on a
@@ -15,7 +15,7 @@ on:
   pull_request:
   push:
     branches:
-      - main
+      - rigel-release
 
 concurrency:
   group: rigel-ci-${{ github.ref }}
