@@ -1485,7 +1485,7 @@ pub enum InputsCommand {
 mod tests {
     use super::*;
     use clap::{Parser, crate_version};
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::MutexGuard;
 
     #[test]
     fn process_completion_uses_only_process_tasks_and_strips_prefix() {
@@ -1505,8 +1505,6 @@ mod tests {
         );
     }
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
     struct EnvVarGuard {
         _lock: MutexGuard<'static, ()>,
         saved: Vec<(String, Option<String>)>,
@@ -1514,7 +1512,9 @@ mod tests {
 
     impl EnvVarGuard {
         fn new(vars: &[&'static str]) -> Self {
-            let lock = ENV_LOCK.lock().unwrap();
+            let lock = crate::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let saved = vars
                 .iter()
                 .map(|&var| (var.to_owned(), env::var(var).ok()))
