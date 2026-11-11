@@ -283,12 +283,20 @@ fn should_attach_to_running_manager(
     mode == ClientRunMode::Follow && interactivity == ClientInteractivity::Interactive
 }
 
-fn should_clear_proxy_routes(
-    manager_was_running: bool,
-    owns_foreground_manager: bool,
-    start_failed: bool,
-) -> bool {
-    owns_foreground_manager || (!manager_was_running && start_failed)
+#[derive(Clone, Copy)]
+enum ProcessStartOwnership {
+    Unclaimed,
+    Existing,
+    Foreground,
+    Detached,
+}
+
+fn should_clear_proxy_routes(ownership: ProcessStartOwnership, start_failed: bool) -> bool {
+    match ownership {
+        ProcessStartOwnership::Foreground => true,
+        ProcessStartOwnership::Detached => start_failed,
+        ProcessStartOwnership::Unclaimed | ProcessStartOwnership::Existing => false,
+    }
 }
 
 /// Keep the startup lock and proxy routes while a slow daemon is still alive.
@@ -656,7 +664,7 @@ impl Devenv {
         if cache_settings.eval_cache {
             eval_cache_pool
                 .get_or_try_init(|| async {
-                    let db_path = devenv_dotfile.join("nix-eval-cache.db");
+                    let db_path = devenv_dotfile.join(devenv_eval_cache::DB_FILENAME);
                     let db = devenv_cache_core::db::Database::new(
                         db_path,
                         &devenv_eval_cache::db::MIGRATIONS,
@@ -811,6 +819,7 @@ impl Devenv {
                             &store,
                             &paths.root,
                             &flake_settings,
+                            nix_settings.refresh_fetchers,
                         )?;
                         devenv_nix_backend::lock::validate_and_load(
                             &eval_state,
@@ -1766,8 +1775,8 @@ impl Devenv {
             // Keep Nix activation first so it snapshots the caller's
             // PATH/XDG_DATA_DIRS before the runtime dotenv layer changes either.
             let mut activation = output;
-            activation.push_str(&dotenv.activation_script());
-            activation.push_str(&dotenv.message_script());
+            push_shell_fragment(&mut activation, &dotenv.activation_script());
+            push_shell_fragment(&mut activation, &dotenv.message_script());
             Ok(activation)
         }
     }
@@ -1857,13 +1866,6 @@ impl Devenv {
 
         let mut shell_cmd = process::Command::new(&bash);
 
-        // When the project root was discovered in a parent directory, run from
-        // where the user actually invoked devenv rather than the root we
-        // chdir'd into. The env is root-scoped; the working directory is not.
-        if let Some(cwd) = &self.shell_cwd {
-            shell_cmd.current_dir(cwd);
-        }
-
         // The Nix output ends with "exec bash" which would start a new shell without
         // the devenv environment. Strip it for ALL modes - we handle shell execution ourselves.
         let output_str = String::from_utf8_lossy(output);
@@ -1909,9 +1911,10 @@ impl Devenv {
         // For non-interactive commands, always use bash directly
         if let Some(cmd) = cmd {
             let mut script = bash_init_script(&shell_env);
-            script.push_str(&dotenv_activation);
-            script.push_str(&task_exports);
-            script.push_str(&dotenv_messages);
+            push_shell_fragment(&mut script, &dotenv_activation);
+            push_shell_fragment(&mut script, &task_exports);
+            push_shell_fragment(&mut script, &dotenv_messages);
+            push_shell_fragment(&mut script, crate::shell_env::CD_INTO_SHELL_CWD);
             // Pass the command via args to avoid changing the script hash.
             // $1 expands before eval; `set --` hides the wrapper's positional parameters.
             // TODO(sander): Add a mode for raw shell source, like `bash -c`.
@@ -1933,10 +1936,15 @@ impl Devenv {
                 // Non-bash: write env script, generate bash wrapper that execs into target shell
                 let env_script_path = self.devenv_dotfile.join("shell-env.sh");
                 let mut env_content = shell_env;
-                env_content.push_str(&dotenv_activation);
-                env_content.push_str(&task_exports);
-                env_content.push_str(&task_messages);
-                env_content.push_str(&dotenv_messages);
+                // `trim_end()` above strips the trailing newline after
+                // `eval "${shellHook:-}"`. Without a separator, the first
+                // `export PATH='…'` lands on that same physical line, bash
+                // consumes the quotes, and PATH values with spaces word-split.
+                push_shell_fragment(&mut env_content, &dotenv_activation);
+                push_shell_fragment(&mut env_content, &task_exports);
+                push_shell_fragment(&mut env_content, &task_messages);
+                push_shell_fragment(&mut env_content, &dotenv_messages);
+                push_shell_fragment(&mut env_content, crate::shell_env::CD_INTO_SHELL_CWD);
                 std::fs::write(&env_script_path, &env_content)
                     .into_diagnostic()
                     .wrap_err("Failed to write env script")?;
@@ -1965,10 +1973,11 @@ impl Devenv {
             } else {
                 // Bash (default)
                 let mut script = bash_init_script(&shell_env);
-                script.push_str(&dotenv_activation);
-                script.push_str(&task_exports);
-                script.push_str(&task_messages);
-                script.push_str(&dotenv_messages);
+                push_shell_fragment(&mut script, &dotenv_activation);
+                push_shell_fragment(&mut script, &task_exports);
+                push_shell_fragment(&mut script, &task_messages);
+                push_shell_fragment(&mut script, &dotenv_messages);
+                push_shell_fragment(&mut script, crate::shell_env::CD_INTO_SHELL_CWD);
                 if self.options.shell_settings.prompt_prefix {
                     script.push_str(BashDialect.prompt_prefix());
                     script.push('\n');
@@ -1988,6 +1997,7 @@ impl Devenv {
             &mut shell_cmd,
             shell_for_env,
             &self.options.shell_settings.clean,
+            self.shell_cwd.as_deref(),
         );
 
         // Inject OTEL trace context so instrumented subprocesses join the trace.
@@ -2127,6 +2137,11 @@ impl Devenv {
         .in_activity(&activity)
         .await?;
 
+        self.show_new_changelogs().await
+    }
+
+    /// Display changes after a project update has completed resolution.
+    pub async fn show_new_changelogs(&self) -> Result<Option<String>> {
         let changelog = crate::changelog::Changelog::new(&self.backend, &self.paths());
         match changelog.show_new().await {
             Ok(output) => Ok(output),
@@ -2514,10 +2529,12 @@ impl Devenv {
         .await
     }
 
-    pub async fn test(&self, verbosity: VerbosityLevel) -> Result<()> {
+    pub async fn test(&self, verbosity: VerbosityLevel, strict_ports: bool) -> Result<()> {
         // Enable port allocation before assemble so that ports resolved
         // during Nix evaluation (e.g. in enterTest) are properly allocated.
+        self.port_allocator.set_strict(strict_ports);
         self.port_allocator.set_enabled(true);
+        self.reserve_running_ports().await;
         self.setup_cachix().await?;
 
         // ── Phase 1: Configuring shell ──────────────────────────────
@@ -2575,8 +2592,15 @@ impl Devenv {
                 mode: ClientRunMode::ReturnAfterStart,
                 ..Default::default()
             };
-            self.start_processes(vec![], devenv_tasks::RunMode::All, envs, options, None)
-                .await?;
+            self.start_processes(
+                vec![],
+                devenv_tasks::RunMode::All,
+                envs,
+                options,
+                None,
+                &mut ProcessStartOwnership::Unclaimed,
+            )
+            .await?;
         }
 
         // ── Phase 5: Running tests ──────────────────────────────────
@@ -2768,18 +2792,18 @@ impl Devenv {
         .await?;
 
         // ── Phase 3: Running processes ──────────────────────────────
-        let manager_was_running =
-            self.native_manager_running().await || self.external_process_manager_state_exists();
-        let owns_foreground_manager =
-            options.mode == ClientRunMode::Follow && !options.daemon && !manager_was_running;
+        let mut ownership = ProcessStartOwnership::Unclaimed;
         let result = self
-            .start_processes(processes, task_mode, envs, options, Some(task_configs))
+            .start_processes(
+                processes,
+                task_mode,
+                envs,
+                options,
+                Some(task_configs),
+                &mut ownership,
+            )
             .await;
-        if should_clear_proxy_routes(
-            manager_was_running,
-            owns_foreground_manager,
-            result.is_err(),
-        ) {
+        if should_clear_proxy_routes(ownership, result.is_err()) {
             crate::proxy::clear(&self.proxy_owner());
         }
         result
@@ -2793,6 +2817,7 @@ impl Devenv {
         envs: HashMap<String, String>,
         mut options: ProcessOptions,
         preloaded_tasks: Option<Vec<tasks::TaskConfig>>,
+        ownership: &mut ProcessStartOwnership,
     ) -> Result<ProcessStartOutcome> {
         // Release port reservations so processes can bind their allocated ports.
         // The port allocator holds TcpListeners during Nix evaluation to prevent
@@ -2932,12 +2957,27 @@ impl Devenv {
                 .make_task_config(roots, task_configs, task_mode, envs)
                 .await?;
 
+            // Serialize discovery and publication across foreground and detached
+            // cold starts. Release before following a manager or waiting for readiness.
+            let startup_lock = self.lock_native_startup().await?;
+            let pid_file = self.native_manager_pid_file();
+            let pid_status = processes::check_pid_file(&pid_file).await;
+            let manager_running = matches!(&pid_status, Ok(processes::PidStatus::Running(_)));
+            *ownership = if manager_running {
+                ProcessStartOwnership::Existing
+            } else if options.mode == ClientRunMode::Follow && !options.daemon {
+                ProcessStartOwnership::Foreground
+            } else {
+                ProcessStartOwnership::Detached
+            };
+
             if options.daemon {
                 // Spawn a separate daemon process via re-exec to avoid
                 // fork-safety issues in this multithreaded process.
                 return self
                     .spawn_daemon_processes(
                         config,
+                        manager_running,
                         &launch_names,
                         &capability_requests,
                         capabilities_required_now,
@@ -2950,10 +2990,8 @@ impl Devenv {
             // attach to it over the control socket and start the up-enabled
             // processes instead of starting a second manager (which would
             // clobber the daemon's PID file/socket and orphan it).
-            let pid_file = self.native_manager_pid_file();
-            if let Ok(processes::PidStatus::Running(pid)) =
-                processes::check_pid_file(&pid_file).await
-            {
+            if let Ok(processes::PidStatus::Running(pid)) = pid_status {
+                drop(startup_lock);
                 // Detached callers must not take ownership of another manager,
                 // and unattended callers must not enter a long-running attach.
                 let interactivity = if std::env::var_os("CI").is_none()
@@ -3038,26 +3076,63 @@ impl Devenv {
             // Run process tasks under the Phase 4 activity.
             // Auto start off processes (start.enable = false) are handled by the
             // process manager: they appear in the TUI as stopped.
-            trace!("devenv.up: running process tasks (run_with_parent_activity)");
-            let _outputs = tasks_runner
-                .run_with_parent_activity(Arc::new(phase4))
-                .await;
+            trace!("devenv.up: running process tasks");
+            let (scheduled_tx, scheduled_rx) = tokio::sync::oneshot::channel();
+            let initial_tasks = {
+                let tasks_runner = Arc::clone(&tasks_runner);
+                tokio::spawn(async move {
+                    tasks_runner
+                        .run_with_parent_activity_and_signal_scheduled(
+                            Arc::new(phase4),
+                            scheduled_tx,
+                        )
+                        .await
+                })
+            };
+
+            // Publish the manager once the process graph is scheduled, as the
+            // daemon does, so that another `devenv up` sees it while processes
+            // are still starting instead of starting a second manager.
+            let published = async {
+                scheduled_rx.await.into_diagnostic().wrap_err(
+                    "Initial process scheduling stopped before the manager was available",
+                )?;
+                let api_server = tasks::NativeApiServer::start(manager)?;
+                processes::write_pid(&api_server.manager().manager_pid_file(), std::process::id())
+                    .await
+                    .map_err(|e| miette!("Failed to write manager PID: {}", e))?;
+                Ok::<_, miette::Report>(api_server)
+            }
+            .await;
+            let api_server = match published {
+                Ok(server) => {
+                    drop(startup_lock);
+                    server
+                }
+                Err(error) => {
+                    // Setup tasks and dependency waiters use the command's shutdown
+                    // token, separately from the process supervisors stopped below.
+                    self.shutdown.shutdown();
+                    let _ = tasks_runner.process_runner().stop_all().await;
+                    // Keep the lock until failed startup has finished cleaning up.
+                    let _ = initial_tasks.await;
+                    return Err(error);
+                }
+            };
+
+            let _outputs = initial_tasks.await;
             let task_status = tasks_runner.get_completion_status().await;
             trace!("devenv.up: process tasks completed");
+
+            let pid_file = api_server.manager().manager_pid_file();
 
             if task_status.has_failures() {
                 // A caller such as `devenv test` must not leave successfully
                 // started process siblings behind when another task fails.
                 let _ = tasks_runner.process_runner().stop_all().await;
+                let _ = tokio::fs::remove_file(&pid_file).await;
                 bail!("Process tasks failed");
             }
-
-            let api_server = tasks::NativeApiServer::start(manager)?;
-
-            let pid_file = api_server.manager().manager_pid_file();
-            processes::write_pid(&pid_file, std::process::id())
-                .await
-                .map_err(|e| miette!("Failed to write manager PID: {}", e))?;
 
             if options.mode == ClientRunMode::Follow {
                 trace!(
@@ -3087,7 +3162,15 @@ impl Devenv {
             return Ok(ProcessStartOutcome::Completed);
         }
 
-        // External manager selected by the Nix configuration.
+        // External managers retain their existing lifecycle. Native ownership
+        // is assigned only after taking the startup lock and checking discovery.
+        *ownership = if self.external_process_manager_state_exists() {
+            ProcessStartOwnership::Existing
+        } else if options.mode == ClientRunMode::Follow && !options.daemon {
+            ProcessStartOwnership::Foreground
+        } else {
+            ProcessStartOwnership::Detached
+        };
         let launcher_script = async {
             let gc_root = self.devenv_dot_gc.join("procfilescript");
             let paths = self
@@ -3168,15 +3251,64 @@ impl Devenv {
         }
     }
 
+    /// Reserve native manager discovery until startup publishes or finishes cleanup.
+    async fn lock_native_startup(&self) -> Result<nix::fcntl::Flock<std::fs::File>> {
+        use nix::fcntl::{Flock, FlockArg};
+
+        let runtime_dir = self.process_runtime_dir()?;
+        std::fs::create_dir_all(runtime_dir)
+            .into_diagnostic()
+            .wrap_err("Failed to create process runtime directory")?;
+        let lock_path = runtime_dir.join("native-start.lock");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("Failed to open startup lock {}", lock_path.display()))?;
+        let mut waiting = false;
+        let cancel = self.shutdown.cancellation_token();
+        loop {
+            if self.shutdown.is_cancelled() {
+                bail!("Process manager startup cancelled");
+            }
+            match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+                Ok(lock) => return Ok(lock),
+                Err((returned_file, nix::errno::Errno::EWOULDBLOCK)) => {
+                    file = returned_file;
+                    if !waiting {
+                        debug!(path = %lock_path.display(), "Waiting for native process manager startup lock");
+                        waiting = true;
+                    }
+                }
+                Err((_, error)) => {
+                    bail!(
+                        "Failed to acquire startup lock {}: {}",
+                        lock_path.display(),
+                        error
+                    );
+                }
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => bail!("Process manager startup cancelled"),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+            }
+        }
+    }
+
     /// Spawn a daemon process that runs the native process manager.
     ///
     /// Instead of fork (which is unsafe in multithreaded programs), this
     /// re-execs the current binary with a hidden `daemon-processes` subcommand.
     /// Standard input/output are disconnected and the daemon is placed in its
-    /// own process group. This does not create a new Unix session.
+    /// own process group. This does not create a new Unix session. The caller
+    /// holds the startup lock until the daemon publishes its PID.
     async fn spawn_daemon_processes(
         &self,
         mut config: tasks::Config,
+        manager_running: bool,
         launch_names: &[String],
         capability_requests: &[processes::CapabilityRequest],
         capabilities_required_now: bool,
@@ -3184,48 +3316,9 @@ impl Devenv {
     ) -> Result<ProcessStartOutcome> {
         let pid_file = self.native_manager_pid_file();
 
-        // Serialize the check-and-spawn sequence across concurrent CLI
-        // processes. Without this lock, two cold `up -d` callers can both see
-        // no PID file, spawn daemons, and race to own the same socket/PID
-        // paths, orphaning the loser and its children. The lock is held until
-        // the winning daemon publishes its PID; the next caller then follows
-        // the normal attach path below.
-        #[cfg(unix)]
-        let _startup_lock = {
-            use nix::fcntl::{Flock, FlockArg};
-
-            let runtime_dir = self.process_runtime_dir()?;
-            std::fs::create_dir_all(runtime_dir)
-                .into_diagnostic()
-                .wrap_err("Failed to create process runtime directory")?;
-            let lock_path = runtime_dir.join("native-start.lock");
-            let lock_file = std::fs::OpenOptions::new()
-                .create(true)
-                // The file is only ever flocked, never written; keep whatever
-                // a previous run left in it.
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(&lock_path)
-                .into_diagnostic()
-                .wrap_err_with(|| {
-                    format!("Failed to open daemon startup lock {}", lock_path.display())
-                })?;
-            Flock::lock(lock_file, FlockArg::LockExclusive).map_err(|(_, e)| {
-                miette!(
-                    "Failed to acquire daemon startup lock {}: {}",
-                    lock_path.display(),
-                    e
-                )
-            })?
-        };
-
         // If a manager is already running, attach to it and start the requested
         // processes rather than spawning a second daemon.
-        if matches!(
-            processes::check_pid_file(&pid_file).await,
-            Ok(processes::PidStatus::Running(_))
-        ) {
+        if manager_running {
             // A foreground `devenv up` invocation in another terminal owns its
             // processes: scheduling into it from here would silently mutate a
             // view the user is watching, and its exit would tear the
@@ -3854,6 +3947,23 @@ pub fn format_shell_exports(exports: &BTreeMap<String, String>) -> String {
         ));
     }
     buf
+}
+
+/// Append a shell-script fragment, inserting a newline first if `dest` does
+/// not already end with one.
+///
+/// Empty fragments are a no-op so callers with no task exports or messages
+/// leave the env script unchanged. Used when concatenating the Nix env script
+/// (which `trim_end()` may leave without a trailing newline) with
+/// `format_shell_exports` / task messages.
+pub fn push_shell_fragment(dest: &mut String, fragment: &str) {
+    if fragment.is_empty() {
+        return;
+    }
+    if !dest.is_empty() && !dest.ends_with('\n') {
+        dest.push('\n');
+    }
+    dest.push_str(fragment);
 }
 
 /// Generate a bash init script that sources .bashrc and applies the devenv shell environment.
@@ -4897,9 +5007,25 @@ BOOTSTRAP_KEY = { description = "bootstrap key", as_path = true }
 
     #[test]
     fn attached_manager_routes_survive_failed_invocations() {
-        assert!(!should_clear_proxy_routes(true, false, true));
-        assert!(should_clear_proxy_routes(false, false, true));
-        assert!(should_clear_proxy_routes(false, true, false));
+        for ownership in [
+            ProcessStartOwnership::Unclaimed,
+            ProcessStartOwnership::Existing,
+        ] {
+            assert!(!should_clear_proxy_routes(ownership, true));
+            assert!(!should_clear_proxy_routes(ownership, false));
+        }
+        assert!(should_clear_proxy_routes(
+            ProcessStartOwnership::Detached,
+            true
+        ));
+        assert!(!should_clear_proxy_routes(
+            ProcessStartOwnership::Detached,
+            false
+        ));
+        assert!(should_clear_proxy_routes(
+            ProcessStartOwnership::Foreground,
+            false
+        ));
     }
 
     #[tokio::test]
@@ -5676,6 +5802,91 @@ BOOTSTRAP_KEY = { description = "bootstrap key", as_path = true }
                 .and_then(|r| r.secrets.get("DEVENV_RIG2828_SECRET")),
             Some(&"present".to_string()),
             "the declared secret must resolve once the reason gate is satisfied"
+        );
+    }
+
+    #[test]
+    fn push_shell_fragment_skips_empty_additions() {
+        let mut script = r#"eval "${shellHook:-}""#.to_string();
+        push_shell_fragment(&mut script, "");
+        assert_eq!(script, r#"eval "${shellHook:-}""#);
+    }
+
+    #[test]
+    fn push_shell_fragment_is_noop_when_body_already_has_newline() {
+        let mut script = "eval true\n".to_string();
+        push_shell_fragment(&mut script, "export FOO=bar\n");
+        assert_eq!(script, "eval true\nexport FOO=bar\n");
+    }
+
+    /// Reproduces the `.devenv/shell-env.sh` assembly in `prepare_shell`:
+    /// `trim_end()` strips the newline after `eval "${shellHook:-}"`, and
+    /// without a separator the first PATH export is glued onto that line.
+    #[test]
+    fn trimmed_shell_env_keeps_path_exports_on_their_own_line() {
+        let output_str = concat!("export FOO=1\n", r#"eval "${shellHook:-}""#, "\n");
+        let shell_env = output_str
+            .trim_end()
+            .trim_end_matches("exec bash")
+            .trim_end_matches("exec $SHELL")
+            .to_string();
+        assert!(
+            !shell_env.ends_with('\n'),
+            "trim_end() must strip the trailing newline for this regression to apply"
+        );
+
+        let mut exports = BTreeMap::new();
+        exports.insert(
+            "PATH".into(),
+            "/tmp/venv/bin:/tmp/Some App/bin:/usr/bin".into(),
+        );
+        exports.insert("VIRTUAL_ENV".into(), "/tmp/venv".into());
+
+        let mut env_content = shell_env;
+        push_shell_fragment(&mut env_content, &format_shell_exports(&exports));
+
+        assert!(
+            !env_content.contains(r#"eval "${shellHook:-}"export"#),
+            "first export must not be glued onto the eval line:\n{env_content}"
+        );
+        let eval_line = env_content
+            .lines()
+            .find(|line| line.contains("shellHook"))
+            .expect("eval line");
+        assert_eq!(eval_line, r#"eval "${shellHook:-}""#);
+
+        let path_line = env_content
+            .lines()
+            .find(|line| line.starts_with("export PATH="))
+            .expect("PATH export");
+        assert!(
+            path_line.contains("Some App"),
+            "PATH export should keep the space-containing directory: {path_line}"
+        );
+
+        // Source the assembled script and print PATH (the original glue caused
+        // bash to word-split the PATH value and reject the remainder).
+        env_content.push_str("printf '%s\\n' \"$PATH\"\n");
+        let script_path = std::env::temp_dir().join(format!(
+            "devenv-shell-env-path-spaces-{}.sh",
+            std::process::id()
+        ));
+        std::fs::write(&script_path, &env_content).expect("write assembled env script");
+
+        let output = std::process::Command::new("bash")
+            .args(["--noprofile", "--norc"])
+            .arg(&script_path)
+            .env_remove("shellHook")
+            .output()
+            .expect("run bash");
+        let _ = std::fs::remove_file(&script_path);
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "bash failed: {stderr}");
+        assert!(stderr.is_empty(), "bash emitted errors: {stderr}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim_end(),
+            "/tmp/venv/bin:/tmp/Some App/bin:/usr/bin"
         );
     }
 }

@@ -1,17 +1,23 @@
 use miette::{IntoDiagnostic, Result, WrapErr, bail};
 use pathdiff;
 use schemars::JsonSchema;
-use schematic::ConfigLoader;
+use schematic::ConfigLoader as SchematicLoader;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
     path::{Path, PathBuf},
 };
 
 const YAML_CONFIG: &str = "devenv.yaml";
 const YAML_LOCAL_CONFIG: &str = "devenv.local.yaml";
+
+#[derive(Clone, Copy)]
+struct ImportRoots<'a> {
+    git_root: Option<&'a Path>,
+    input_sources: &'a BTreeMap<String, PathBuf>,
+}
 
 /// Version requirement for the devenv CLI.
 ///
@@ -483,29 +489,77 @@ impl From<PathBuf> for Config {
     }
 }
 
+/// An out-of-tree configuration merged below the project's configuration.
+#[derive(Clone, Copy, Debug)]
+pub enum ConfigSource<'a> {
+    /// A live directory. Its Git root is detected from the filesystem.
+    Local(&'a Path),
+    /// A fetched directory, with an explicit repository root because store
+    /// trees do not retain Git metadata.
+    Fetched {
+        directory: &'a Path,
+        repository_root: &'a Path,
+    },
+}
+
+/// Loads a project's YAML graph without fetching inputs or accessing a Nix store.
+///
+/// Source configuration merges below the project's configuration. Relative
+/// source inputs and imports resolve from the source directory, and its
+/// `devenv.nix` module is included even when it has no YAML configuration.
+/// Locked input locations let the loader discover YAML from input-style imports.
+///
+/// ```no_run
+/// use std::path::Path;
+/// use devenv_core::config::{ConfigLoader, ConfigSource};
+///
+/// let config = ConfigLoader::new(Path::new("."))
+///     .with_source(ConfigSource::Local(Path::new("../shared")))
+///     .load()?;
+/// # Ok::<(), miette::Report>(())
+/// ```
+pub struct ConfigLoader<'a> {
+    root: &'a Path,
+    source: Option<ConfigSource<'a>>,
+    input_sources: Option<&'a BTreeMap<String, PathBuf>>,
+}
+
+impl<'a> ConfigLoader<'a> {
+    pub fn new(root: &'a Path) -> Self {
+        Self {
+            root,
+            source: None,
+            input_sources: None,
+        }
+    }
+
+    pub fn with_source(mut self, source: ConfigSource<'a>) -> Self {
+        self.source = Some(source);
+        self
+    }
+
+    /// Supply selected input roots, already including any flake `dir` parameter.
+    pub fn with_input_sources(mut self, sources: &'a BTreeMap<String, PathBuf>) -> Self {
+        self.input_sources = Some(sources);
+        self
+    }
+
+    pub fn load(self) -> Result<Config> {
+        Config::load_sources(self)
+    }
+}
+
 impl Config {
     pub fn load() -> Result<Self> {
         Self::load_from("./")
-    }
-
-    /// Like [`Config::load`], but additionally merges the configuration of an
-    /// out-of-tree source directory (a `path:` `--from` source).
-    ///
-    /// The source's `devenv.yaml` import graph merges at the lowest precedence
-    /// (the project's own configuration wins), and the source's inputs and
-    /// imports are rewritten to absolute `path:` form so they resolve from the
-    /// live source directory regardless of the project root. The source's
-    /// module (`devenv.nix`) is appended to `imports` as an absolute `path:`
-    /// import, so it must exist even when the source has no `devenv.yaml`.
-    pub fn load_with_source(source_dir: Option<&Path>) -> Result<Self> {
-        Self::load_from_with_source("./", source_dir)
     }
 
     /// Loads configuration from a directory path, including all imported configurations.
     ///
     /// This method recursively loads the base `devenv.yaml` file and all configurations
     /// referenced in the `imports` field. Configurations are merged according to their
-    /// field-specific merge strategies.
+    /// field-specific merge strategies. Use [`ConfigLoader`] to also include an
+    /// out-of-tree source or locked input locations.
     ///
     /// # Arguments
     /// * `path` - The directory containing the base `devenv.yaml` file
@@ -523,16 +577,21 @@ impl Config {
     where
         P: AsRef<Path>,
     {
-        Self::load_from_with_source(path, None)
+        ConfigLoader::new(path.as_ref()).load()
     }
 
-    /// [`Config::load_from`] with an optional out-of-tree source directory;
-    /// see [`Config::load_with_source`] for the source merge semantics.
-    pub fn load_from_with_source<P>(path: P, source_dir: Option<&Path>) -> Result<Self>
-    where
-        P: AsRef<Path>,
-    {
-        let base_path = path.as_ref();
+    fn load_sources(context: ConfigLoader<'_>) -> Result<Self> {
+        let base_path = context.root;
+        let (source_dir, source_repository_root) = match context.source {
+            None => (None, None),
+            Some(ConfigSource::Local(directory)) => (Some(directory), None),
+            Some(ConfigSource::Fetched {
+                directory,
+                repository_root,
+            }) => (Some(directory), Some(repository_root)),
+        };
+        let empty_sources = BTreeMap::new();
+        let input_sources = context.input_sources.unwrap_or(&empty_sources);
         let base_yaml = base_path.join(YAML_CONFIG);
 
         // Collect imported yaml files only (not the base). These are merged
@@ -554,7 +613,7 @@ impl Config {
         }
 
         // Load the base config first to get the imports
-        let mut temp_loader = ConfigLoader::<Config>::new();
+        let mut temp_loader = SchematicLoader::<Config>::new();
         temp_loader
             .file_optional(&base_yaml)
             .into_diagnostic()
@@ -578,14 +637,21 @@ impl Config {
         let mut source_yamls = Vec::new();
         let mut source_dir_only_imports = Vec::new();
         let mut source_module_imports = Vec::new();
-        // Canonical root of the out-of-tree source (`None` if it doesn't
-        // resolve). Reused to import the source module and to classify which
-        // inputs were defined by source-side configs.
-        let source_root_canon = source_dir.and_then(|d| d.canonicalize().ok());
+        let source_dir_canon = source_dir.and_then(|dir| dir.canonicalize().ok());
+        let detected_source_repository_root = source_dir
+            .filter(|_| source_repository_root.is_none())
+            .and_then(Self::detect_git_root);
+        let source_repository_root =
+            source_repository_root.or(detected_source_repository_root.as_deref());
+        let source_containment_root = source_repository_root
+            .or(source_dir)
+            .and_then(|root| root.canonicalize().ok());
         if let Some(source_dir) = source_dir {
-            let source_git_root = Self::detect_git_root(source_dir);
-            let source_yaml = source_dir.join(YAML_CONFIG);
-            if source_yaml.exists() {
+            for source_yaml in [YAML_CONFIG, YAML_LOCAL_CONFIG]
+                .map(|name| source_dir.join(name))
+                .into_iter()
+                .filter(|path| path.exists())
+            {
                 let canonical =
                     source_yaml
                         .canonicalize()
@@ -598,7 +664,7 @@ impl Config {
                         })?;
                 visited.insert(canonical);
 
-                let mut source_loader = ConfigLoader::<Config>::new();
+                let mut source_loader = SchematicLoader::<Config>::new();
                 source_loader
                     .file_optional(&source_yaml)
                     .into_diagnostic()
@@ -619,7 +685,10 @@ impl Config {
                 Self::collect_import_files(
                     &source_result.config.imports,
                     source_dir,
-                    source_git_root.as_deref(),
+                    ImportRoots {
+                        git_root: source_repository_root,
+                        input_sources,
+                    },
                     &mut source_yamls,
                     &mut source_dir_only_imports,
                     &mut visited,
@@ -644,8 +713,10 @@ impl Config {
                         let resolved = Self::resolve_import_path(
                             import,
                             source_dir,
-                            source_git_root.as_deref(),
-                        )?;
+                            source_repository_root,
+                            input_sources,
+                        )?
+                        .expect("file imports always resolve");
                         let resolved = resolved.canonicalize().unwrap_or(resolved);
                         source_module_imports.push(format!("path:{}", resolved.display()));
                     }
@@ -654,24 +725,20 @@ impl Config {
 
             // The source module itself (devenv.nix plus devenv.local.nix at
             // eval time), imported live even when the source has no yaml.
-            let canonical = source_root_canon
+            let canonical = source_dir_canon
                 .clone()
                 .unwrap_or_else(|| source_dir.to_path_buf());
             source_module_imports.push(format!("path:{}", canonical.display()));
-
-            // The source's devenv.local.yaml applies as machine-local
-            // overrides of the source, still below the project's own configs.
-            let source_local = source_dir.join(YAML_LOCAL_CONFIG);
-            if source_local.exists() {
-                source_yamls.push(source_local);
-            }
         }
 
         // Recursively collect imported yaml files (loaded first, lowest priority)
         Self::collect_import_files(
             &temp_result.config.imports,
             base_path,
-            git_root.as_deref(),
+            ImportRoots {
+                git_root: git_root.as_deref(),
+                input_sources,
+            },
             &mut imported_yamls,
             &mut dir_only_imports,
             &mut visited,
@@ -687,14 +754,14 @@ impl Config {
 
         // Load all configs and track which inputs come from which config file.
         // This is needed to correctly normalize relative URLs.
-        let mut loader = ConfigLoader::<Config>::new();
+        let mut loader = SchematicLoader::<Config>::new();
         let mut input_source_dirs: HashMap<String, PathBuf> = HashMap::new();
 
         for yaml_file in load_order {
             let config_dir = yaml_file.parent().unwrap_or(Path::new(".")).to_path_buf();
 
             // Load this config file to see what inputs it defines
-            let mut single_loader = ConfigLoader::<Config>::new();
+            let mut single_loader = SchematicLoader::<Config>::new();
             single_loader
                 .file_optional(yaml_file)
                 .into_diagnostic()
@@ -710,8 +777,10 @@ impl Config {
 
             // Record the source directory for each input defined in this config.
             // Later configs take precedence (base overrides imports).
-            for input_name in single_result.config.inputs.keys() {
-                input_source_dirs.insert(input_name.clone(), config_dir.clone());
+            for (input_name, input) in &single_result.config.inputs {
+                if input.url.is_some() {
+                    input_source_dirs.insert(input_name.clone(), config_dir.clone());
+                }
             }
 
             loader
@@ -726,7 +795,7 @@ impl Config {
         let local_yaml = base_path.join(YAML_LOCAL_CONFIG);
         if local_yaml.exists() {
             // Track inputs from local yaml too
-            let mut local_loader = ConfigLoader::<Config>::new();
+            let mut local_loader = SchematicLoader::<Config>::new();
             local_loader
                 .file_optional(&local_yaml)
                 .into_diagnostic()
@@ -737,10 +806,10 @@ impl Config {
                     )
                 })?;
             if let Ok(local_result) = local_loader.load().into_diagnostic() {
-                for input_name in local_result.config.inputs.keys() {
-                    input_source_dirs
-                        .entry(input_name.clone())
-                        .or_insert_with(|| base_path.to_path_buf());
+                for (input_name, input) in &local_result.config.inputs {
+                    if input.url.is_some() {
+                        input_source_dirs.insert(input_name.clone(), base_path.to_path_buf());
+                    }
                 }
             }
         }
@@ -808,11 +877,12 @@ impl Config {
                 // the live source tree; emit them absolute so they stay valid
                 // from the project root (relative escapes also break under
                 // lazy-trees).
-                let from_source_side = source_root_canon.as_ref().is_some_and(|root| {
-                    input_dir
-                        .canonicalize()
-                        .is_ok_and(|dir| dir.starts_with(root))
-                });
+                let from_source_side =
+                    source_containment_root.as_ref().is_some_and(|root| {
+                        input_dir
+                            .canonicalize()
+                            .is_ok_and(|dir| dir.starts_with(root))
+                    }) || Self::containing_input_source(input_dir, input_sources).is_some();
                 if from_source_side {
                     if let Some(url) = canonical_url(&resolved, &query_suffix) {
                         input.url = Some(url);
@@ -872,7 +942,8 @@ impl Config {
         // Add all loaded file imports (normalized).
         for yaml_path in &imported_yamls {
             if let Some(import_dir) = yaml_path.parent()
-                && let Some(normalized) = Self::normalize_path(import_dir, base_path)
+                && let Some(normalized) =
+                    Self::normalize_import_path(import_dir, base_path, input_sources)
                 && seen.insert(normalized.clone())
             {
                 final_imports.push(normalized);
@@ -883,7 +954,8 @@ impl Config {
         // devenv.yaml of their own. There's nothing to merge, but their
         // devenv.nix should still be loaded.
         for import_dir in &dir_only_imports {
-            if let Some(normalized) = Self::normalize_path(import_dir, base_path)
+            if let Some(normalized) =
+                Self::normalize_import_path(import_dir, base_path, input_sources)
                 && seen.insert(normalized.clone())
             {
                 final_imports.push(normalized);
@@ -1005,6 +1077,56 @@ impl Config {
     /// Checks if an import is a file-based import (relative or absolute path).
     fn is_file_import(import: &str) -> bool {
         import.starts_with("./") || import.starts_with("../") || import.starts_with('/')
+    }
+
+    /// Names of declared inputs referenced by `imports`.
+    ///
+    /// These are the only inputs the backend needs to materialize while
+    /// composing YAML, avoiding an eager fetch of unrelated inputs such as
+    /// nixpkgs.
+    pub fn input_import_names(&self) -> BTreeSet<String> {
+        self.imports
+            .iter()
+            .filter(|import| !Self::is_file_import(import) && !import.starts_with("path:"))
+            .filter_map(|import| import.split('/').next())
+            .filter(|name| self.inputs.contains_key(*name))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Find the most specific locked input source containing `path`.
+    fn containing_input_source<'a>(
+        path: &Path,
+        input_sources: &'a BTreeMap<String, PathBuf>,
+    ) -> Option<(&'a str, &'a Path)> {
+        let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        input_sources
+            .iter()
+            .filter(|(_, root)| canonical_path.starts_with(root))
+            .max_by_key(|(_, root)| root.components().count())
+            .map(|(name, root)| (name.as_str(), root.as_path()))
+    }
+
+    /// Render a resolved module path relative to an input when possible, and
+    /// relative to the project otherwise.
+    fn normalize_import_path(
+        source: &Path,
+        base: &Path,
+        input_sources: &BTreeMap<String, PathBuf>,
+    ) -> Option<String> {
+        if let Some((name, root)) = Self::containing_input_source(source, input_sources) {
+            let source = source
+                .canonicalize()
+                .unwrap_or_else(|_| source.to_path_buf());
+            let relative = source.strip_prefix(root).ok()?;
+            if relative.as_os_str().is_empty() {
+                Some(name.to_string())
+            } else {
+                Some(format!("{name}/{}", relative.display()))
+            }
+        } else {
+            Self::normalize_path(source, base)
+        }
     }
 
     /// Normalizes a path relative to a base directory.
@@ -1223,25 +1345,41 @@ impl Config {
         import: &str,
         base_path: &Path,
         git_root: Option<&Path>,
-    ) -> Result<PathBuf> {
-        let resolved = if import.starts_with('/') {
-            if let Some(root) = git_root {
-                root.join(import.strip_prefix('/').unwrap())
+        input_sources: &BTreeMap<String, PathBuf>,
+    ) -> Result<Option<PathBuf>> {
+        let containing_source = Self::containing_input_source(base_path, input_sources);
+        let (resolved, security_root, security_git_root) = if import.starts_with('/') {
+            if let Some((_, root)) = containing_source {
+                (root.join(import.strip_prefix('/').unwrap()), root, None)
+            } else if let Some(root) = git_root {
+                (root.join(import.strip_prefix('/').unwrap()), root, git_root)
             } else {
                 bail!(
                     "Absolute import path '{}' requires a git repository. Use relative paths (e.g., './' or '../') instead.",
                     import
                 );
             }
+        } else if Self::is_file_import(import) {
+            let security_root = containing_source
+                .map(|(_, root)| root)
+                .unwrap_or_else(|| git_root.unwrap_or(base_path));
+            (
+                base_path.join(import),
+                security_root,
+                containing_source.is_none().then_some(git_root).flatten(),
+            )
         } else {
-            base_path.join(import)
+            let (input_name, subpath) = import.split_once('/').unwrap_or((import, ""));
+            let Some(root) = input_sources.get(input_name) else {
+                return Ok(None);
+            };
+            (root.join(subpath), root.as_path(), None)
         };
 
         // Security check
-        let security_root = git_root.unwrap_or(base_path);
-        Self::validate_within_root(&resolved, security_root, import, git_root)?;
+        Self::validate_within_root(&resolved, security_root, import, security_git_root)?;
 
-        Ok(resolved)
+        Ok(Some(resolved))
     }
 
     /// Recursively collects all import files starting from the given imports list.
@@ -1253,11 +1391,12 @@ impl Config {
     /// # Arguments
     /// * `imports` - List of import paths (directories) to process
     /// * `base_path` - The base directory for resolving relative import paths
-    /// * `git_root` - Optional git repository root for resolving absolute paths and security checks
+    /// * `roots` - Git and locked-input roots used for resolution and security checks
     /// * `yaml_files` - Accumulator for collecting YAML file paths in load order
-    /// * `dir_only_imports` - Accumulator for imported directories that have no `devenv.yaml`
-    ///   of their own. There's nothing to merge or recurse into, but the directory still needs
-    ///   to end up in the final imports list so its `devenv.nix` gets loaded.
+    /// * `dir_only_imports` - Accumulator for imported directories without a
+    ///   `devenv.yaml`, and directly imported Nix files. There's nothing to
+    ///   merge or recurse into, but each module still needs to reach the final
+    ///   imports list.
     /// * `visited` - Set of canonical paths already visited (prevents circular imports)
     /// * `depth` - Current recursion depth (prevents stack overflow)
     ///
@@ -1273,7 +1412,7 @@ impl Config {
     fn collect_import_files(
         imports: &[String],
         base_path: &Path,
-        git_root: Option<&Path>,
+        roots: ImportRoots<'_>,
         yaml_files: &mut Vec<PathBuf>,
         dir_only_imports: &mut Vec<PathBuf>,
         visited: &mut HashSet<PathBuf>,
@@ -1290,7 +1429,13 @@ impl Config {
 
         for import in imports {
             // Resolve and validate the import path
-            let import_path = Self::resolve_import_path(import, base_path, git_root)?;
+            let Some(import_path) =
+                Self::resolve_import_path(import, base_path, roots.git_root, roots.input_sources)?
+            else {
+                // Input-style imports are resolved in a second pass after the
+                // backend materializes their locked sources.
+                continue;
+            };
 
             if import_path.is_dir() {
                 let yaml_path = import_path.join(YAML_CONFIG);
@@ -1315,7 +1460,7 @@ impl Config {
                     yaml_files.push(yaml_path.clone());
 
                     // Load this config to get its imports
-                    let mut temp_loader = ConfigLoader::<Config>::new();
+                    let mut temp_loader = SchematicLoader::<Config>::new();
                     temp_loader
                         .file_optional(&yaml_path)
                         .into_diagnostic()
@@ -1334,7 +1479,7 @@ impl Config {
                     Self::collect_import_files(
                         &temp_result.config.imports,
                         &import_path,
-                        git_root,
+                        roots,
                         yaml_files,
                         dir_only_imports,
                         visited,
@@ -1358,6 +1503,22 @@ impl Config {
                         dir_only_imports.push(import_path.clone());
                     }
                 }
+            } else if import_path.is_file() {
+                // A transitive `./module.nix` import has no YAML to merge, but
+                // it still needs to reach the final Nix module list.
+                let canonical_file =
+                    import_path
+                        .canonicalize()
+                        .into_diagnostic()
+                        .wrap_err_with(|| {
+                            format!(
+                                "Failed to canonicalize import path: {}",
+                                import_path.display()
+                            )
+                        })?;
+                if visited.insert(canonical_file) {
+                    dir_only_imports.push(import_path);
+                }
             }
         }
 
@@ -1372,7 +1533,7 @@ impl Config {
     }
 
     fn write_to(&self, root_dir: &Path) -> Result<()> {
-        let yaml = serde_yaml::to_string(&self)
+        let yaml = serde_norway::to_string(&self)
             .into_diagnostic()
             .wrap_err("Failed to serialize config to YAML")?;
         let content = format!(
@@ -1383,6 +1544,105 @@ impl Config {
             .into_diagnostic()
             .wrap_err("Failed to write devenv.yaml")?;
         Ok(())
+    }
+
+    /// Edit only this file's input, preserving surrounding YAML presentation.
+    /// Resolve follows against the loaded configuration, but never write merged
+    /// imports or local overrides back into the project's file. Unsupported edits
+    /// fail before writing rather than falling back to a lossy rewrite.
+    pub fn add_input_to_file(
+        &self,
+        root_dir: &Path,
+        name: &str,
+        url: &str,
+        follows: &[String],
+    ) -> Result<()> {
+        let mut resolved = Config {
+            inputs: self.inputs.clone(),
+            ..Default::default()
+        };
+        resolved.add_input(name, url, follows)?;
+        let input = &resolved.inputs[name];
+        let path = root_dir.join(YAML_CONFIG);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                "# yaml-language-server: $schema=https://devenv.sh/devenv.schema.json\n".to_string()
+            }
+            Err(error) => {
+                return Err(error)
+                    .into_diagnostic()
+                    .wrap_err_with(|| format!("Failed to read {}", path.display()));
+            }
+        };
+
+        let mut expected: serde_norway::Value = serde_norway::from_str(&text)
+            .into_diagnostic()
+            .wrap_err("Failed to parse devenv.yaml")?;
+        if expected.is_null() {
+            expected = serde_norway::Value::Mapping(Default::default());
+        }
+        let inputs = expected
+            .as_mapping_mut()
+            .ok_or_else(|| miette::miette!("devenv.yaml must contain a YAML mapping"))?
+            .entry("inputs".into())
+            .or_insert(serde_norway::Value::Null);
+        if inputs.is_null() {
+            *inputs = serde_norway::Value::Mapping(Default::default());
+        }
+        inputs
+            .as_mapping_mut()
+            .ok_or_else(|| miette::miette!("devenv.yaml inputs must be a YAML mapping"))?
+            .insert(
+                name.into(),
+                serde_norway::to_value(input).into_diagnostic()?,
+            );
+
+        // Keep the whole stream: comments and directives can live outside the
+        // document node itself.
+        let file: yaml_edit::YamlFile = text
+            .parse()
+            .into_diagnostic()
+            .wrap_err("Failed to parse devenv.yaml for editing")?;
+        let document = file.ensure_document();
+        if document.get_mapping("inputs").is_none() {
+            let inputs = if document
+                .as_mapping()
+                .is_some_and(|mapping| mapping.is_flow_style())
+            {
+                yaml_edit::Mapping::new_flow()
+            } else {
+                yaml_edit::Mapping::new_pending_block()
+            };
+            document.set("inputs", inputs);
+        }
+        let inputs = document
+            .get_mapping("inputs")
+            .ok_or_else(|| miette::miette!("Cannot edit devenv.yaml inputs in place"))?;
+        // A nested block mapping is not valid inside a flow mapping. JSON gives
+        // us a properly escaped flow-style fragment without hand-rendering YAML.
+        let fragment = if inputs.is_flow_style() {
+            serde_json::to_string(input).into_diagnostic()?
+        } else {
+            serde_norway::to_string(input).into_diagnostic()?
+        };
+        let fragment: yaml_edit::Document = fragment.parse().into_diagnostic()?;
+        let mapping = fragment
+            .as_mapping()
+            .ok_or_else(|| miette::miette!("Serialized input must be a YAML mapping"))?;
+        inputs.set(name, mapping);
+
+        let edited = file.to_string();
+        let actual: serde_norway::Value =
+            serde_norway::from_str(&edited).into_diagnostic().wrap_err(
+                "Cannot edit devenv.yaml without invalidating its YAML; file was not changed",
+            )?;
+        if actual != expected {
+            bail!("Cannot edit devenv.yaml without changing other values; file was not changed");
+        }
+        std::fs::write(&path, edited)
+            .into_diagnostic()
+            .wrap_err("Failed to write devenv.yaml")
     }
 
     /// Add a new input, overwriting any existing input with the same name.
@@ -1438,7 +1698,7 @@ impl Config {
     ///
     /// Merging uses schematic's `#[setting(merge)]` strategies declared on
     /// `NixpkgsConfig` — same policy as the import-time merge in
-    /// `ConfigLoader`. `Vec` fields accumulate via `append_vec`, scalars use
+    /// `SchematicLoader`. `Vec` fields accumulate via `append_vec`, scalars use
     /// `replace`. No special platform-only semantics.
     pub fn nixpkgs_config(&self, system: &str) -> NixpkgsConfig {
         use schematic::{Config as _, PartialConfig as _};
@@ -1596,6 +1856,189 @@ mod tests {
         );
     }
 
+    fn add_input_in_file(yaml: Option<&str>, name: &str, follows: &[String]) -> String {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(YAML_CONFIG);
+        if let Some(yaml) = yaml {
+            fs::write(&path, yaml).unwrap();
+        }
+        Config::load_from(directory.path())
+            .unwrap()
+            .add_input_to_file(directory.path(), name, "github:org/new", follows)
+            .unwrap();
+        fs::read_to_string(path).unwrap()
+    }
+
+    #[test]
+    fn add_input_to_file_preserves_comments_and_order() {
+        let yaml = "# header\nallow_unfree: true\ninputs:\n  # existing input\n  old:\n    url: 'github:org/old' # inline\n# imports note\nimports: []\n";
+        let written = add_input_in_file(Some(yaml), "new", &["nixpkgs".into()]);
+        assert_eq!(
+            written,
+            yaml.replace(
+                "# imports note",
+                "  new:\n    url: github:org/new\n    inputs:\n      nixpkgs:\n        follows: nixpkgs\n# imports note"
+            )
+        );
+    }
+
+    #[test]
+    fn add_input_to_file_replaces_an_existing_input_in_place() {
+        let yaml = "inputs:\n  # old input\n  old:\n    url: github:org/old\n    inputs:\n      nixpkgs:\n        follows: nixpkgs\n  # sibling\n  sibling:\n    url: 'github:org/sibling' # keep\n";
+        assert_eq!(
+            add_input_in_file(Some(yaml), "old", &[]),
+            yaml.replace(
+                "    url: github:org/old\n    inputs:\n      nixpkgs:\n        follows: nixpkgs\n",
+                "    url: github:org/new\n"
+            )
+        );
+    }
+
+    #[test]
+    fn add_input_to_file_edits_flow_mappings() {
+        let yaml = "# header\ninputs: {old: {url: 'github:org/old'}} # inline\n";
+        let written = add_input_in_file(Some(yaml), "new", &["nixpkgs".into()]);
+        assert!(written.starts_with("# header\ninputs: {old: {url: 'github:org/old'}, "));
+        assert!(written.ends_with("} # inline\n"));
+        let config = load_yaml(&written);
+        assert_eq!(config.inputs.len(), 2);
+        assert_eq!(
+            config.inputs["new"].inputs["nixpkgs"].follows.as_deref(),
+            Some("nixpkgs")
+        );
+    }
+
+    #[test]
+    fn add_input_to_file_handles_escaped_keys_and_document_markers() {
+        let yaml =
+            "# header\n---\n\"inpu\\u0074s\":\n  old:\n    url: github:org/old\n...\n# footer\n";
+        let written = add_input_in_file(Some(yaml), "new", &[]);
+        assert_eq!(
+            written,
+            yaml.replace("...", "  new:\n    url: github:org/new\n...")
+        );
+    }
+
+    #[test]
+    fn add_input_to_file_initializes_missing_or_empty_inputs() {
+        for yaml in [
+            "",
+            "# header\n",
+            "# header\ninputs:\n",
+            "# header\ninputs: null\n",
+            "# header\ninputs: {}\n",
+            "# header\nallow_unfree: true\n\n\n",
+            "{allow_unfree: true}\n",
+            "{inputs: null}\n",
+        ] {
+            let written = add_input_in_file(Some(yaml), "new", &[]);
+            if yaml.starts_with("# header") {
+                assert!(written.starts_with("# header\n"));
+            }
+            if yaml.ends_with("\n\n\n") {
+                assert!(written.contains("\n\n\n"));
+            }
+            assert_eq!(
+                load_yaml(&written).inputs["new"].url.as_deref(),
+                Some("github:org/new")
+            );
+        }
+        let written = add_input_in_file(None, "new", &[]);
+        assert!(
+            written.starts_with(
+                "# yaml-language-server: $schema=https://devenv.sh/devenv.schema.json\n"
+            )
+        );
+        assert_eq!(
+            load_yaml(&written).inputs["new"].url.as_deref(),
+            Some("github:org/new")
+        );
+    }
+
+    #[test]
+    fn add_input_to_file_preserves_existing_line_endings() {
+        for yaml in [
+            "# header\r\ninputs:\r\n  old:\r\n    url: github:org/old\r\n",
+            "# header\r\ninputs:\n  old:\n    url: github:org/old\n",
+        ] {
+            assert!(add_input_in_file(Some(yaml), "new", &[]).starts_with(yaml));
+        }
+    }
+
+    #[test]
+    fn add_input_to_file_escapes_names_and_urls() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(YAML_CONFIG);
+        let name = "new: input\nquoted";
+        let url = "path:/tmp/a: b # literal";
+        for yaml in ["inputs: {}\n", "inputs:\n  old:\n    url: github:org/old\n"] {
+            fs::write(&path, yaml).unwrap();
+            Config::load_from(directory.path())
+                .unwrap()
+                .add_input_to_file(directory.path(), name, url, &[])
+                .unwrap();
+            let written = fs::read_to_string(&path).unwrap();
+            assert_eq!(load_yaml(&written).inputs[name].url.as_deref(), Some(url));
+        }
+    }
+
+    #[test]
+    fn add_input_to_file_does_not_write_merged_inputs_or_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let yaml = "# root\ninputs:\n  old:\n    url: github:org/old\nimports:\n  - ./sub\n";
+        fs::write(root.join(YAML_CONFIG), yaml).unwrap();
+        fs::create_dir(root.join("sub")).unwrap();
+        fs::write(
+            root.join("sub").join(YAML_CONFIG),
+            "inputs:\n  imported:\n    url: github:org/imported\n",
+        )
+        .unwrap();
+        fs::write(root.join(YAML_LOCAL_CONFIG), "allow_unfree: true\ninputs:\n  local:\n    url: github:org/local\n  old:\n    url: github:org/override\n").unwrap();
+        Config::load_from(root)
+            .unwrap()
+            .add_input_to_file(
+                root,
+                "new",
+                "github:org/new",
+                &["imported".into(), "local".into()],
+            )
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join(YAML_CONFIG)).unwrap(),
+            yaml.replace("imports:", "  new:\n    url: github:org/new\n    inputs:\n      imported:\n        follows: imported\n      local:\n        follows: local\nimports:")
+        );
+    }
+
+    #[test]
+    fn add_input_to_file_leaves_file_unchanged_on_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let path = root.join(YAML_CONFIG);
+        for yaml in [
+            "inputs:\n  old: &base\n    url: github:org/old\n  sibling: *base\n",
+            "inputs: [not, a, mapping]\n",
+            "inputs: {\n",
+            "---\ninputs: {}\n---\ninputs: {}\n",
+        ] {
+            fs::write(&path, yaml).unwrap();
+            assert!(
+                Config::default()
+                    .add_input_to_file(root, "old", "github:org/new", &[])
+                    .is_err()
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), yaml);
+        }
+        let yaml = "# header\ninputs: {}\n";
+        fs::write(&path, yaml).unwrap();
+        assert!(
+            Config::default()
+                .add_input_to_file(root, "new", "github:org/new", &["missing".into()])
+                .is_err()
+        );
+        assert_eq!(fs::read_to_string(path).unwrap(), yaml);
+    }
+
     #[test]
     fn project_prompt_prefix_can_be_overridden_locally() {
         let directory = tempfile::tempdir().unwrap();
@@ -1664,7 +2107,7 @@ mod tests {
     #[test]
     fn default_config_serializes_to_empty_yaml() {
         let config = Config::default();
-        let yaml = serde_yaml::to_string(&config).expect("Failed to serialize config");
+        let yaml = serde_norway::to_string(&config).expect("Failed to serialize config");
         assert_eq!(
             yaml.trim(),
             "{}",
@@ -1685,14 +2128,14 @@ mod tests {
             ..Default::default()
         };
 
-        let yaml = serde_yaml::to_string(&config).expect("Failed to serialize config");
+        let yaml = serde_norway::to_string(&config).expect("Failed to serialize config");
         assert!(yaml.contains("profile: production"));
     }
 
     #[test]
     fn profile_field_not_serialized_when_none() {
         let config = Config::default();
-        let yaml = serde_yaml::to_string(&config).expect("Failed to serialize config");
+        let yaml = serde_norway::to_string(&config).expect("Failed to serialize config");
         assert!(!yaml.contains("profile"));
     }
 
@@ -1715,6 +2158,160 @@ mod tests {
     }
 
     #[test]
+    fn locked_input_source_composes_remote_yaml_graph() {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let project = temp_dir.path().join("project");
+        let shared = temp_dir.path().join("shared");
+        let backend = shared.join("profiles/backend");
+        let nested = backend.join("nested");
+        fs::create_dir_all(&project).expect("Failed to create project");
+        fs::create_dir_all(&nested).expect("Failed to create nested remote config");
+        fs::create_dir_all(backend.join("dependency")).expect("Failed to create path input");
+
+        fs::write(
+            project.join("devenv.yaml"),
+            r#"
+inputs:
+  shared:
+    url: github:example/shared
+    flake: false
+  nixpkgs:
+    url: github:NixOS/nixpkgs/root
+imports:
+  - shared/profiles/backend
+strict_ports: false
+"#,
+        )
+        .expect("Failed to write project config");
+        fs::write(
+            backend.join("devenv.yaml"),
+            r#"
+inputs:
+  nixpkgs:
+    url: github:NixOS/nixpkgs/imported
+  tool:
+    url: github:example/tool
+  local-dependency:
+    url: path:./dependency
+    flake: false
+imports:
+  - ./nested
+  - ./extra.nix
+reload: false
+"#,
+        )
+        .expect("Failed to write remote config");
+        fs::write(backend.join("devenv.nix"), "{ }").expect("Failed to write remote module");
+        fs::write(backend.join("extra.nix"), "{ }").expect("Failed to write remote Nix import");
+        fs::write(
+            nested.join("devenv.yaml"),
+            "inputs:\n  nested-tool:\n    url: github:example/nested-tool\n",
+        )
+        .expect("Failed to write nested config");
+        fs::write(nested.join("devenv.nix"), "{ }").expect("Failed to write nested module");
+
+        let shared = shared
+            .canonicalize()
+            .expect("Failed to canonicalize input source");
+        let input_sources = BTreeMap::from([("shared".to_string(), shared)]);
+        let config = ConfigLoader::new(&project)
+            .with_input_sources(&input_sources)
+            .load()
+            .expect("Failed to compose locked input config");
+
+        assert!(config.inputs.contains_key("tool"));
+        assert!(config.inputs.contains_key("nested-tool"));
+        assert_eq!(
+            config.inputs["nixpkgs"].url.as_deref(),
+            Some("github:NixOS/nixpkgs/root"),
+            "the root project must retain precedence over imported inputs"
+        );
+        assert_eq!(
+            config.inputs["local-dependency"].url,
+            Some(format!(
+                "path:{}",
+                backend
+                    .join("dependency")
+                    .canonicalize()
+                    .expect("Failed to canonicalize path input")
+                    .display()
+            ))
+        );
+        assert_eq!(config.reload, Some(false));
+        assert_eq!(config.strict_ports, Some(false));
+        assert!(
+            config
+                .imports
+                .contains(&"shared/profiles/backend".to_string())
+        );
+        assert!(
+            config
+                .imports
+                .contains(&"shared/profiles/backend/nested".to_string())
+        );
+        assert!(
+            config
+                .imports
+                .contains(&"shared/profiles/backend/extra.nix".to_string())
+        );
+    }
+
+    #[test]
+    fn locked_input_source_rejects_import_escape() {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let project = temp_dir.path().join("project");
+        let shared = temp_dir.path().join("shared");
+        let profile = shared.join("profiles/backend");
+        fs::create_dir_all(&project).expect("Failed to create project");
+        fs::create_dir_all(&profile).expect("Failed to create remote config");
+        fs::write(
+            project.join("devenv.yaml"),
+            "inputs:\n  shared:\n    url: github:example/shared\nimports:\n  - shared/profiles/backend\n",
+        )
+        .expect("Failed to write project config");
+        fs::write(
+            profile.join("devenv.yaml"),
+            "imports:\n  - ../../../outside\n",
+        )
+        .expect("Failed to write remote config");
+
+        let input_sources = BTreeMap::from([(
+            "shared".to_string(),
+            shared
+                .canonicalize()
+                .expect("Failed to canonicalize input source"),
+        )]);
+        let error = ConfigLoader::new(&project)
+            .with_input_sources(&input_sources)
+            .load()
+            .expect_err("an imported config must not escape its locked source");
+        assert!(
+            error.to_string().contains("resolves outside"),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn input_import_names_only_returns_declared_input_targets() {
+        let config = Config {
+            inputs: BTreeMap::from([("shared".to_string(), Input::default())]),
+            imports: vec![
+                "./local".to_string(),
+                "path:/absolute/local".to_string(),
+                "missing/profile".to_string(),
+                "shared/profile".to_string(),
+                "shared/other".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            config.input_import_names(),
+            BTreeSet::from(["shared".to_string()])
+        );
+    }
+
+    #[test]
     fn strict_ports_field_none_by_default() {
         let config = Config::default();
         assert_eq!(config.strict_ports, None);
@@ -1727,14 +2324,14 @@ mod tests {
             ..Default::default()
         };
 
-        let yaml = serde_yaml::to_string(&config).expect("Failed to serialize config");
+        let yaml = serde_norway::to_string(&config).expect("Failed to serialize config");
         assert!(yaml.contains("strict_ports: true"));
     }
 
     #[test]
     fn strict_ports_field_not_serialized_when_none() {
         let config = Config::default();
-        let yaml = serde_yaml::to_string(&config).expect("Failed to serialize config");
+        let yaml = serde_norway::to_string(&config).expect("Failed to serialize config");
         assert!(!yaml.contains("strict_ports"));
     }
 
@@ -1920,6 +2517,63 @@ imports:
     }
 
     #[test]
+    fn target_local_yaml_relative_input_overrides_source_input() {
+        let source = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        fs::create_dir(source.path().join("original")).unwrap();
+        fs::create_dir(source.path().join("override")).unwrap();
+        fs::create_dir(target.path().join("override")).unwrap();
+        fs::write(source.path().join("devenv.nix"), "{}").unwrap();
+        fs::write(
+            source.path().join("devenv.yaml"),
+            "inputs:\n  shared:\n    url: path:./original\n    flake: false\n",
+        )
+        .unwrap();
+        fs::write(
+            target.path().join("devenv.local.yaml"),
+            "inputs:\n  shared:\n    url: path:./override\n    flake: false\n",
+        )
+        .unwrap();
+        let config = ConfigLoader::new(target.path())
+            .with_source(ConfigSource::Local(source.path()))
+            .load()
+            .unwrap();
+        assert_eq!(
+            config.inputs["shared"].url.as_deref(),
+            Some("path:override")
+        );
+    }
+
+    #[test]
+    fn source_local_yaml_imports_are_loaded() {
+        let source = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let extra = source.path().join("extra");
+        fs::create_dir(&extra).unwrap();
+        fs::write(source.path().join("devenv.nix"), "{}").unwrap();
+        fs::write(
+            source.path().join("devenv.local.yaml"),
+            "imports:\n  - ./extra\n",
+        )
+        .unwrap();
+        fs::write(
+            extra.join("devenv.yaml"),
+            "inputs:\n  extra:\n    url: github:example/extra\n",
+        )
+        .unwrap();
+        fs::write(extra.join("devenv.nix"), "{}").unwrap();
+        let config = ConfigLoader::new(target.path())
+            .with_source(ConfigSource::Local(source.path()))
+            .load()
+            .unwrap();
+        assert!(
+            config.inputs.contains_key("extra"),
+            "local YAML import was dropped: {:?}",
+            config.imports
+        );
+    }
+
+    #[test]
     fn source_dir_config_merges_below_project() {
         let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
         let root = temp_dir.path();
@@ -1952,7 +2606,9 @@ inputs:
         )
         .expect("Failed to write project config");
 
-        let config = Config::load_from_with_source(&project, Some(source.as_path()))
+        let config = ConfigLoader::new(&project)
+            .with_source(ConfigSource::Local(source.as_path()))
+            .load()
             .expect("Failed to load config");
 
         assert_eq!(
@@ -2009,7 +2665,9 @@ inputs:
         // The bound project lives elsewhere entirely and has no config.
         let project_dir = tempfile::tempdir().expect("Failed to create project dir");
 
-        let config = Config::load_from_with_source(project_dir.path(), Some(profile.as_path()))
+        let config = ConfigLoader::new(project_dir.path())
+            .with_source(ConfigSource::Local(profile.as_path()))
+            .load()
             .expect("Failed to load config");
 
         assert!(
@@ -2031,6 +2689,51 @@ inputs:
     }
 
     #[test]
+    fn explicit_source_root_allows_imports_without_git_metadata() {
+        let repository = tempfile::tempdir().expect("Failed to create repository");
+        let common = repository.path().join("profiles").join("common");
+        let dependency = common.join("dependency");
+        let rooted = repository.path().join("rooted");
+        let profile = repository.path().join("profiles").join("rails");
+        fs::create_dir_all(&dependency).expect("Failed to create common dependency");
+        fs::create_dir(&rooted).expect("Failed to create rooted module");
+        fs::create_dir_all(&profile).expect("Failed to create profile");
+        fs::write(
+            common.join("devenv.yaml"),
+            "inputs:\n  shared-input:\n    url: path:./dependency\n",
+        )
+        .expect("Failed to write common config");
+        fs::write(rooted.join("devenv.nix"), "{ }\n").expect("Failed to write rooted module");
+        fs::write(
+            profile.join("devenv.yaml"),
+            "imports:\n  - ../common\n  - /rooted\n",
+        )
+        .expect("Failed to write profile config");
+
+        let project = tempfile::tempdir().expect("Failed to create project");
+        let config = ConfigLoader::new(project.path())
+            .with_source(ConfigSource::Fetched {
+                directory: &profile,
+                repository_root: repository.path(),
+            })
+            .load()
+            .expect("Failed to load config");
+
+        let expected_url = format!("path:{}", dependency.canonicalize().unwrap().display());
+        assert_eq!(
+            config
+                .inputs
+                .get("shared-input")
+                .and_then(|input| input.url.as_deref()),
+            Some(expected_url.as_str())
+        );
+        for imported in [&common, &rooted] {
+            let import = format!("path:{}", imported.canonicalize().unwrap().display());
+            assert!(config.imports.contains(&import), "missing import {import}");
+        }
+    }
+
+    #[test]
     fn source_relative_input_becomes_absolute() {
         let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
         let source = temp_dir.path().join("source");
@@ -2043,7 +2746,9 @@ inputs:
         .expect("Failed to write source config");
 
         let project_dir = tempfile::tempdir().expect("Failed to create project dir");
-        let config = Config::load_from_with_source(project_dir.path(), Some(source.as_path()))
+        let config = ConfigLoader::new(project_dir.path())
+            .with_source(ConfigSource::Local(source.as_path()))
+            .load()
             .expect("Failed to load config");
 
         assert_eq!(
@@ -2060,7 +2765,9 @@ inputs:
         fs::create_dir(&source).expect("Failed to create source dir");
 
         let project_dir = tempfile::tempdir().expect("Failed to create project dir");
-        let config = Config::load_from_with_source(project_dir.path(), Some(source.as_path()))
+        let config = ConfigLoader::new(project_dir.path())
+            .with_source(ConfigSource::Local(source.as_path()))
+            .load()
             .expect("Failed to load config");
 
         let source_import = format!("path:{}", source.canonicalize().unwrap().display());
@@ -2603,27 +3310,29 @@ imports:
     #[test]
     fn require_version_yaml_bool() {
         let yaml = "require_version: true\n";
-        let parsed: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
-        let rv: RequireVersion = serde_yaml::from_value(parsed["require_version"].clone()).unwrap();
+        let parsed: serde_norway::Value = serde_norway::from_str(yaml).unwrap();
+        let rv: RequireVersion =
+            serde_norway::from_value(parsed["require_version"].clone()).unwrap();
         assert_eq!(rv, RequireVersion::Match(true));
     }
 
     #[test]
     fn require_version_yaml_string() {
         let yaml = "require_version: \">=2.0.0\"\n";
-        let parsed: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
-        let rv: RequireVersion = serde_yaml::from_value(parsed["require_version"].clone()).unwrap();
+        let parsed: serde_norway::Value = serde_norway::from_str(yaml).unwrap();
+        let rv: RequireVersion =
+            serde_norway::from_value(parsed["require_version"].clone()).unwrap();
         assert_eq!(rv, RequireVersion::Constraint(">=2.0.0".to_string()));
     }
 
     #[test]
     fn cachix_auth_token_yaml_bool() {
-        let enabled: CachixAuthToken = serde_yaml::from_str("true").unwrap();
+        let enabled: CachixAuthToken = serde_norway::from_str("true").unwrap();
         assert_eq!(enabled, CachixAuthToken::Enabled(true));
         assert_eq!(enabled.secret_name(), Some("CACHIX_AUTH_TOKEN"));
         assert!(enabled.is_required());
 
-        let disabled: CachixAuthToken = serde_yaml::from_str("false").unwrap();
+        let disabled: CachixAuthToken = serde_norway::from_str("false").unwrap();
         assert_eq!(disabled, CachixAuthToken::Enabled(false));
         assert_eq!(disabled.secret_name(), None);
         assert!(!disabled.is_required());
@@ -2631,7 +3340,7 @@ imports:
 
     #[test]
     fn cachix_auth_token_yaml_string() {
-        let setting: CachixAuthToken = serde_yaml::from_str("MY_TEAM_CACHIX_TOKEN").unwrap();
+        let setting: CachixAuthToken = serde_norway::from_str("MY_TEAM_CACHIX_TOKEN").unwrap();
         assert_eq!(
             setting,
             CachixAuthToken::Name("MY_TEAM_CACHIX_TOKEN".to_string())
@@ -2708,7 +3417,7 @@ nixpkgs:
     #[test]
     fn devenv_yaml_snake_case_parses() {
         let cfg = load_yaml(SNAKE_CASE_INPUT);
-        let expected: serde_yaml::Value = serde_yaml::from_str(
+        let expected: serde_norway::Value = serde_norway::from_str(
             r#"
 allow_unfree: true
 allow_unsupported_system: true
@@ -2729,7 +3438,7 @@ strict_ports: true
 "#,
         )
         .unwrap();
-        assert_eq!(serde_yaml::to_value(&cfg).unwrap(), expected);
+        assert_eq!(serde_norway::to_value(&cfg).unwrap(), expected);
 
         // skip_serializing fields don't appear in Value; check directly.
         let nixpkgs = cfg.nixpkgs.unwrap();
@@ -2744,8 +3453,8 @@ strict_ports: true
         let snake = load_yaml(SNAKE_CASE_INPUT);
         let camel = load_yaml(CAMELCASE_INPUT);
         assert_eq!(
-            serde_yaml::to_value(&camel).unwrap(),
-            serde_yaml::to_value(&snake).unwrap()
+            serde_norway::to_value(&camel).unwrap(),
+            serde_norway::to_value(&snake).unwrap()
         );
         // skip_serializing fields don't appear in Value; check directly.
         let snake_nixpkgs = snake.nixpkgs.unwrap();

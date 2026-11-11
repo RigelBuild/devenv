@@ -152,6 +152,7 @@ export default defineConfig({
             { label: 'Creating Files', slug: 'creating-files' },
             { label: 'SecretSpec', slug: 'integrations/secretspec' },
             { label: 'Tasks', slug: 'tasks' },
+            { label: 'Git', slug: 'git' },
             { label: 'Git Hooks', slug: 'git-hooks' },
             { label: 'Tests', slug: 'tests' },
             { label: 'Pinning', slug: 'pinning' },
@@ -225,6 +226,7 @@ export default defineConfig({
           collapsed: true,
           items: [
             { label: 'Ad-hoc Environments', slug: 'ad-hoc-developer-environments' },
+            { label: 'Out-of-tree devenvs', slug: 'guides/out-of-tree-devenvs' },
             { label: 'Examples', slug: 'examples' },
             { label: 'Cloud', slug: 'cloud' },
             { label: 'Migrating to 2.0', slug: 'guides/migrating-to-20' },

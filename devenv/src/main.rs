@@ -43,7 +43,7 @@ mod commands;
 use clap::{CommandFactory, crate_version};
 use clap_complete::CompleteEnv;
 use devenv::{
-    CacheSettings, ClientRunMode, Config, Devenv, InputOverrides, NixSettings, ProcessStartOutcome,
+    CacheSettings, ClientRunMode, Devenv, InputOverrides, NixSettings, ProcessStartOutcome,
     SecretSettings, ShellSettings, VerbosityLevel,
     activity::{ActivityGuard, ActivityLevel},
     cli::{
@@ -57,10 +57,11 @@ use devenv::{
     tui::{SessionIo, ShellSession},
 };
 use devenv_mailbox::{FrontendCommand, FrontendEvent};
+use devenv_nix_backend::project::{ProjectConfig, ProjectSource, UpdatePolicy, resolve_project};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use std::{
     collections::BTreeMap,
-    env, fs,
+    env,
     io::{self, IsTerminal, Write},
     os, panic,
     path::{Path, PathBuf},
@@ -75,6 +76,7 @@ use tracing::{info, instrument};
 
 const DEVENV_CALLER: &str = "_DEVENV_CALLER";
 const DEVENV_SHELL_HINT: &str = "_DEVENV_SHELL_HINT";
+const DEVENV_HOOK_DIR: &str = "_DEVENV_HOOK_DIR";
 
 fn main() {
     if let Some(code) = devenv_processes::maybe_run_process_guardian() {
@@ -156,7 +158,7 @@ fn main_inner() -> Result<()> {
             _ => {}
         }
 
-        let prepared = prepare_command(cli, invocation.shell_hint.as_deref())?;
+        let prepared = prepare_command(cli, &invocation)?;
 
         match run(prepared, invocation.caller) {
             Err(err) => match err.downcast::<devenv::SecretsNeedPrompting>() {
@@ -258,12 +260,14 @@ enum Caller {
 struct Invocation {
     caller: Caller,
     shell_hint: Option<String>,
+    hook_dir: Option<PathBuf>,
 }
 
 impl Invocation {
     fn from_env() -> Self {
         let caller = env::var_os(DEVENV_CALLER);
         let shell_hint = env::var(DEVENV_SHELL_HINT).ok();
+        let hook_dir = env::var_os(DEVENV_HOOK_DIR).map(PathBuf::from);
         // This runs before devenv starts any threads. Removing the one-shot
         // invocation metadata prevents commands launched by an activated shell
         // from inheriting the original caller or its ambient shell hint.
@@ -275,21 +279,30 @@ impl Invocation {
         Self::from_parts(
             caller.as_deref().and_then(|value| value.to_str()),
             shell_hint,
+            hook_dir,
         )
     }
 
-    fn from_parts(caller: Option<&str>, shell_hint: Option<String>) -> Self {
+    fn from_parts(
+        caller: Option<&str>,
+        shell_hint: Option<String>,
+        hook_dir: Option<PathBuf>,
+    ) -> Self {
         let caller = match caller {
             Some("direnv") => Caller::Direnv,
             Some("hook") => Caller::Hook,
             _ => Caller::Cli,
         };
-        let shell_hint = match caller {
-            Caller::Hook => shell_hint,
-            Caller::Cli | Caller::Direnv => None,
+        let (shell_hint, hook_dir) = match caller {
+            Caller::Hook => (shell_hint, hook_dir),
+            Caller::Cli | Caller::Direnv => (None, None),
         };
 
-        Self { caller, shell_hint }
+        Self {
+            caller,
+            shell_hint,
+            hook_dir,
+        }
     }
 }
 
@@ -423,7 +436,7 @@ fn enter_discovered_project_root() -> Result<()> {
 }
 
 /// Prepare a config-backed CLI command for execution.
-fn prepare_command(mut cli: Cli, shell_hint: Option<&str>) -> Result<PreparedCommand> {
+fn prepare_command(mut cli: Cli, invocation: &Invocation) -> Result<PreparedCommand> {
     // --- Project discovery and working directory ---
 
     // Source priority: explicit `--from` / `-O` overrides > a local devenv.nix
@@ -432,16 +445,18 @@ fn prepare_command(mut cli: Cli, shell_hint: Option<&str>) -> Result<PreparedCom
     // supplied.
     // Has to run before Config::load() reads "./devenv.yaml".
     let original_cwd = env::current_dir().ok();
-    let user_config_path = cli.user_config.as_deref().map(|path| {
-        devenv_core::paths::resolve_against(path, original_cwd.as_deref().unwrap_or(Path::new(".")))
-    });
+    let start_dir = invocation.hook_dir.as_deref().or(original_cwd.as_deref());
+    let user_config_path = cli
+        .user_config
+        .as_deref()
+        .map(|path| devenv_core::paths::resolve_against(path, start_dir.unwrap_or(Path::new("."))));
     let command = cli.command;
     let has_overrides = !cli.input_overrides.nix_module_options.is_empty();
     let mut from_source = cli.from.clone();
     let mut project_root = None;
     if from_source.is_none()
         && !has_overrides
-        && let Some(cwd) = original_cwd.as_deref()
+        && let Some(cwd) = start_dir
     {
         project_root = devenv_core::paths::find_project_root(cwd);
         if let Some(root) = project_root.as_deref() {
@@ -467,9 +482,10 @@ fn prepare_command(mut cli: Cli, shell_hint: Option<&str>) -> Result<PreparedCom
     }
 
     let discovered_root = project_root
-        .as_ref()
-        .filter(|r| Some(r.as_path()) != original_cwd.as_deref())
-        .cloned();
+        .as_deref()
+        .or(start_dir)
+        .filter(|r| Some(*r) != original_cwd.as_deref())
+        .map(Path::to_path_buf);
     // When discovery moves us into a parent root, remember the directory the
     // user actually invoked from so the interactive shell and `-- cmd` still
     // run there. The devenv environment is root-scoped; the cwd is not.
@@ -521,61 +537,30 @@ fn prepare_command(mut cli: Cli, shell_hint: Option<&str>) -> Result<PreparedCom
 
     // --- Project configuration ---
 
-    // A `path:` source resolves to a live directory whose devenv.yaml graph is
-    // merged into the config by Config::load_with_source, which also appends
-    // the source's module as an absolute `path:` import. Relative refs resolve
-    // against the invocation cwd (persisted bindings are always absolute).
-    let from_path = from_source
-        .as_deref()
-        .and_then(|from| from.strip_prefix("path:"))
-        .map(|path_str| {
-            let full_path = devenv_core::paths::resolve_against(
-                Path::new(path_str),
-                &env::current_dir().unwrap_or_default(),
-            );
-            fs::canonicalize(&full_path).unwrap_or(full_path)
-        });
-
-    let mut config = Config::load_with_source(from_path.as_deref())?;
-    config.check_version(crate_version!())?;
+    let nix_debugger = cli.nix_args.nix_debugger;
+    let nix_options = devenv_core::NixOptions::from(cli.nix_args);
+    let refresh_fetchers = matches!(&command, Commands::Update { .. });
 
     let input_overrides = InputOverrides::from(cli.input_overrides);
-    for chunk in input_overrides.override_inputs.chunks_exact(2) {
-        let [name, url] = chunk else {
-            unreachable!("chunks_exact(2)")
-        };
-        config
-            .override_input_url(name, url)
-            .wrap_err_with(|| format!("Failed to override input {name} with URL {url}"))?;
-    }
-
-    // A non-path source (flake ref, via --from or a persisted binding) is
-    // fetched as the `from` input and its devenv.nix imported from the store.
-    // Its devenv.yaml is not merged (that needs a fetch before config load);
-    // `path:` sources get the full merge via Config::load_with_source above.
-    if from_path.is_none()
-        && let Some(from) = &from_source
-    {
-        let from_input = devenv_core::config::Input {
-            url: Some(from.clone()),
-            flake: false,
-            follows: None,
-            inputs: BTreeMap::new(),
-            overlays: Vec::new(),
-        };
-        config.inputs.insert("from".to_string(), from_input);
-        config.imports.push("from".to_string());
-    }
+    let mut project = ProjectConfig::new(".");
+    project.input_overrides = input_overrides.override_inputs.clone();
+    project.source = from_source.as_deref().map(|reference| {
+        ProjectSource::from_reference(reference, &env::current_dir().unwrap_or_default())
+    });
+    let update = match &command {
+        Commands::Update { name: Some(name) } => UpdatePolicy::Input(name),
+        Commands::Update { name: None } => UpdatePolicy::All,
+        _ => UpdatePolicy::Preserve,
+    };
+    let resolved = resolve_project(&project, nix_options.clone(), update)?;
+    resolved.config.check_version(crate_version!())?;
+    resolved.write_lock()?;
+    let config = resolved.config;
 
     // --- Resolved settings ---
 
-    // Read before the conversion consumes `cli.nix_args`.
-    let nix_debugger = cli.nix_args.nix_debugger;
-    let mut nix_settings =
-        NixSettings::resolve(devenv_core::NixOptions::from(cli.nix_args), &config);
-    if matches!(command, Commands::Update { .. }) {
-        nix_settings.refresh_fetchers = true;
-    }
+    let mut nix_settings = NixSettings::resolve(nix_options, &config);
+    nix_settings.refresh_fetchers = refresh_fetchers;
     if matches!(
         command,
         Commands::Machines {
@@ -598,7 +583,7 @@ fn prepare_command(mut cli: Cli, shell_hint: Option<&str>) -> Result<PreparedCom
     let mut shell_settings = ShellSettings::resolve_with_shell_hint(
         devenv_core::ShellOptions::from(cli.shell_args),
         &config,
-        shell_hint,
+        invocation.shell_hint.as_deref(),
     );
     shell_settings.prompt_prefix = config.prompt_prefix.unwrap_or(user_prompt_prefix);
     frontend.tui_context = Arc::new(devenv_tui::TuiRunContext {
@@ -965,6 +950,7 @@ fn run(prepared: PreparedCommand, caller: Caller) -> Result<CommandResult> {
         shutdown,
     } = prepared;
 
+    let _terminal_state = devenv_tui::app::TerminalStateGuard::save();
     let (renderer, _activity_guard) = Renderer::init(&frontend);
     let tui = matches!(&renderer, Renderer::Tui { .. });
     let shell_session = ShellSessionOptions {
@@ -978,11 +964,9 @@ fn run(prepared: PreparedCommand, caller: Caller) -> Result<CommandResult> {
         tracing::info!("using project root {}", root.display());
     }
 
-    // TUI terminal setup: save state before raw mode, install a restore hook
-    // for panics. Force-exit (second Ctrl+C) is handled below.
+    // Install a display restore hook for panics. The command-scoped guard
+    // restores terminal settings on ordinary exits, including errors.
     if tui {
-        devenv_tui::app::save_terminal_state();
-
         let prev_hook = panic::take_hook();
         panic::set_hook(Box::new(move |info| {
             devenv_tui::app::restore_terminal();
@@ -998,6 +982,8 @@ fn run(prepared: PreparedCommand, caller: Caller) -> Result<CommandResult> {
         devenv_processes::kill_process_scopes();
         if tui {
             devenv_tui::app::restore_terminal();
+        } else {
+            devenv_tui::app::restore_terminal_state();
         }
     });
 
@@ -1386,7 +1372,7 @@ async fn dispatch_command(
             Ok(CommandResult::Exec(shell_config.command))
         }
         Commands::Test { .. } => {
-            devenv.test(verbosity).await?;
+            devenv.test(verbosity, config_strict_ports).await?;
             Ok(CommandResult::Done)
         }
         Commands::Container { command } => match command {
@@ -1453,8 +1439,8 @@ async fn dispatch_command(
             let json = devenv.eval(&attributes).await?;
             Ok(CommandResult::Print(format!("{json}\n")))
         }
-        Commands::Update { name } => Ok(devenv
-            .update(&name)
+        Commands::Update { .. } => Ok(devenv
+            .show_new_changelogs()
             .await?
             .map_or(CommandResult::Done, CommandResult::Print)),
         Commands::Up { up_args } => {
@@ -1704,7 +1690,7 @@ async fn dispatch_command(
             // Re-read dotenv after tasks so generated files are exported on the
             // same direnv activation.
             let mut output = devenv.print_dev_env(false).await?;
-            output.push_str(&devenv::format_shell_exports(&task_exports));
+            devenv::push_shell_fragment(&mut output, &devenv::format_shell_exports(&task_exports));
             Ok(CommandResult::Print(output))
         }
         Commands::PrintPaths => {
@@ -1937,6 +1923,7 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 mod tests {
     use super::*;
     use std::ffi::OsString;
+    use std::fs;
     use std::sync::Mutex;
 
     static PROCESS_STATE_LOCK: Mutex<()> = Mutex::new(());
@@ -1966,21 +1953,36 @@ mod tests {
 
     #[test]
     fn shell_hint_is_only_accepted_from_hook_invocations() {
-        let hook = Invocation::from_parts(Some("hook"), Some("zsh".to_string()));
+        let hook = Invocation::from_parts(Some("hook"), Some("zsh".to_string()), None);
         assert!(matches!(hook.caller, Caller::Hook));
         assert_eq!(hook.shell_hint.as_deref(), Some("zsh"));
 
-        let cli = Invocation::from_parts(None, Some("zsh".to_string()));
+        let cli = Invocation::from_parts(None, Some("zsh".to_string()), None);
         assert!(matches!(cli.caller, Caller::Cli));
         assert!(cli.shell_hint.is_none());
 
-        let direnv = Invocation::from_parts(Some("direnv"), Some("zsh".to_string()));
+        let direnv = Invocation::from_parts(Some("direnv"), Some("zsh".to_string()), None);
         assert!(matches!(direnv.caller, Caller::Direnv));
         assert!(direnv.shell_hint.is_none());
     }
 
+    #[test]
+    fn hook_dir_is_only_accepted_from_hook_invocations() {
+        let dir = PathBuf::from("/project");
+
+        let hook = Invocation::from_parts(Some("hook"), None, Some(dir.clone()));
+        assert_eq!(hook.hook_dir.as_deref(), Some(dir.as_path()));
+
+        let cli = Invocation::from_parts(None, None, Some(dir.clone()));
+        assert!(cli.hook_dir.is_none());
+
+        let direnv = Invocation::from_parts(Some("direnv"), None, Some(dir));
+        assert!(direnv.hook_dir.is_none());
+    }
+
     struct ProcessStateGuard {
         cwd: PathBuf,
+        pwd: Option<OsString>,
         devenv_home: Option<OsString>,
     }
 
@@ -1988,6 +1990,7 @@ mod tests {
         fn set(cwd: &Path, devenv_home: &Path) -> Self {
             let guard = Self {
                 cwd: env::current_dir().unwrap(),
+                pwd: env::var_os("PWD"),
                 devenv_home: env::var_os("DEVENV_HOME"),
             };
             env::set_current_dir(cwd).unwrap();
@@ -2004,6 +2007,10 @@ mod tests {
             // SAFETY: See ProcessStateGuard::set; restoration happens before
             // PROCESS_STATE_LOCK is released, including during unwinding.
             unsafe {
+                match &self.pwd {
+                    Some(pwd) => env::set_var("PWD", pwd),
+                    None => env::remove_var("PWD"),
+                }
                 match &self.devenv_home {
                     Some(home) => env::set_var("DEVENV_HOME", home),
                     None => env::remove_var("DEVENV_HOME"),
@@ -2019,15 +2026,16 @@ mod tests {
         fs::write(project.path().join("devenv.nix"), "{ }\n").unwrap();
         let devenv_home = project.path().join("devenv-home");
         let _state = ProcessStateGuard::set(project.path(), &devenv_home);
+        let cli_invocation = Invocation::from_parts(None, None, None);
 
         commands::hook::allow(&devenv_home, None, &["base".to_string()]).unwrap();
 
         let cli = <Cli as clap::Parser>::parse_from(["devenv", "shell"]);
-        let prepared = prepare_command(cli, None).unwrap();
+        let prepared = prepare_command(cli, &cli_invocation).unwrap();
         assert_eq!(prepared.backend.devenv.shell_settings.profiles, ["base"]);
 
         let cli = <Cli as clap::Parser>::parse_from(["devenv", "--profile=explicit", "shell"]);
-        let prepared = prepare_command(cli, None).unwrap();
+        let prepared = prepare_command(cli, &cli_invocation).unwrap();
         assert_eq!(
             prepared.backend.devenv.shell_settings.profiles,
             ["explicit"]
@@ -2035,8 +2043,35 @@ mod tests {
 
         commands::hook::allow(&devenv_home, None, &[]).unwrap();
         let cli = <Cli as clap::Parser>::parse_from(["devenv", "shell"]);
-        let prepared = prepare_command(cli, None).unwrap();
+        let prepared = prepare_command(cli, &cli_invocation).unwrap();
         assert!(prepared.backend.devenv.shell_settings.profiles.is_empty());
+    }
+
+    #[test]
+    fn hook_invocation_resolves_its_project_from_a_subdirectory() {
+        let _lock = PROCESS_STATE_LOCK.lock().unwrap();
+        let project = TempDir::new().unwrap();
+        let root = fs::canonicalize(project.path()).unwrap();
+        fs::write(root.join("devenv.nix"), "{ }\n").unwrap();
+        let subdir = root.join("sub");
+        fs::create_dir(&subdir).unwrap();
+        let _state = ProcessStateGuard::set(&subdir, &root.join("devenv-home"));
+        let hook = Invocation::from_parts(Some("hook"), None, Some(root.clone()));
+
+        for args in [
+            &["devenv", "shell"][..],
+            &["devenv", "--option", "env.FOO:string", "bar", "shell"][..],
+        ] {
+            env::set_current_dir(&subdir).unwrap();
+            let cli = <Cli as clap::Parser>::parse_from(args);
+            let prepared = prepare_command(cli, &hook).unwrap();
+            assert_eq!(env::current_dir().unwrap(), root, "{args:?}");
+            assert_eq!(
+                prepared.backend.devenv.shell_cwd.as_deref(),
+                Some(subdir.as_path()),
+                "{args:?}"
+            );
+        }
     }
 
     #[test]

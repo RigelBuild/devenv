@@ -37,6 +37,14 @@ We have a rule that new features need to come with documentation and tests (`dev
 - `cargo fmt` - Format code.
 - `cargo clippy` - Lint code.
 
+Evaluate the flake package on its native platform. Import-from-derivation is
+currently allowed because rolling nixpkgs applies source patches during evaluation.
+This can build the patch derivation:
+
+```sh
+nix eval --raw .#devenv.drvPath --option allow-import-from-derivation true
+```
+
 ## Adding changelogs for breaking and behavior changes
 
 When making breaking changes or important behavior changes that affect users, add a changelog entry so they are informed after running `devenv update`.

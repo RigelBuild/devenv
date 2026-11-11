@@ -42,6 +42,20 @@ def --env _devenv_hook [] {
         return
     }
 
+    # Following the user out of a devenv shell can land them in another
+    # project. Check again whenever the directory changed, so that project
+    # activates now rather than on the next prompt (#3129). A loop rather than
+    # recursion, so hopping between projects doesn't grow the call stack.
+    mut checked_dir = ""
+    while $env.PWD != $checked_dir {
+        $checked_dir = $env.PWD
+        _devenv_hook_check
+    }
+}
+
+# One activation check for $PWD; `_devenv_hook` repeats it after following the
+# user out of a devenv shell.
+def --env _devenv_hook_check [] {
     # Just exited the devenv shell for this dir — don't re-spawn until you leave.
     if ($env._DEVENV_HOOK_ACTIVATED == $env.PWD) {
         return
@@ -65,7 +79,7 @@ def --env _devenv_hook [] {
             # `try` nushell aborts the hook on that non-zero exit and never
             # follows the user to `exit-dir` below.
             try {
-                with-env { _DEVENV_HOOK_DIR: $dir, _DEVENV_CALLER: "hook", _DEVENV_SHELL_HINT: "nu" } { do { cd $dir; ^devenv shell@DEVENV_SHELL_ARGS@ } }
+                with-env { _DEVENV_HOOK_DIR: $dir, _DEVENV_CALLER: "hook", _DEVENV_SHELL_HINT: "nu" } { ^devenv shell@DEVENV_SHELL_ARGS@ }
             }
             let exit_dir_file = ($dir + "/.devenv/exit-dir")
             if ($exit_dir_file | path exists) {

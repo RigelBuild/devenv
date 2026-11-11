@@ -1171,7 +1171,7 @@ pub enum ProcessesCommand {
     },
 
     #[command(
-        about = "Attach to running processes and stream their status and logs until Ctrl-C, leaving them running."
+        about = "Attach to running processes and stream their status and logs until q or Ctrl-C, leaving them running."
     )]
     Attach {},
 
@@ -1665,6 +1665,21 @@ mod tests {
             }
             .supports_tui()
         );
+    }
+
+    #[test]
+    fn export_commands_support_tui() {
+        for command in [
+            vec!["direnv-export"],
+            vec!["print-dev-env"],
+            vec!["print-dev-env", "--json"],
+        ] {
+            for flags in [vec![], vec!["--tui", "true"]] {
+                let cli =
+                    Cli::parse_from(["devenv"].into_iter().chain(flags).chain(command.clone()));
+                assert!(cli.command.supports_tui(), "{command:?}");
+            }
+        }
     }
 
     #[test]

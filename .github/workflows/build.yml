@@ -42,6 +42,13 @@ jobs:
           name: devenv
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
+      # Rolling nixpkgs applies source patches through IFD using target tools.
+      - name: Evaluate Darwin package
+        if: inputs.system == 'aarch64-darwin'
+        run: |
+          nix eval --raw .#packages.aarch64-darwin.devenv.drvPath \
+            --option allow-import-from-derivation true
+
       # Build and cache the devenv-tasks binary used by the module system
       - name: Build devenv-tasks-${{ inputs.system }}
         run: |
@@ -124,13 +131,20 @@ jobs:
         run: |
           ${{ steps.build-devenv.outputs.path }}/bin/devenv --system ${{ inputs.system }} shell -- cargo nextest run -j 4 --features devenv/test-all --retries 3
 
-      # devenv-tasks is outside Cargo's default workspace members. Run its
-      # process scheduling regressions explicitly on Linux and macOS.
-      - name: Check concurrent process scheduling
+      # devenv-tui is outside Cargo's default workspace test set.
+      - name: Check terminal settings after killed tasks
         run: |
           ${{ steps.build-devenv.outputs.path }}/bin/devenv --system ${{ inputs.system }} shell -- \
-            cargo nextest run -p devenv-tasks -j 2 --retries 0 \
-              -E 'test(concurrent_dynamic_starts_share_never_started_process_prerequisite) | test(concurrent_start_stop_keeps_explicitly_stopped_dependencies_off)'
+            cargo nextest run -p devenv-tui --lib --retries 0 \
+              -E 'test(command_guard_restores_terminal_after_killed_task)'
+
+      # devenv-tasks is outside Cargo's default workspace members. Run its
+      # process scheduling and manager lifecycle regressions on Linux and macOS.
+      - name: Check process scheduling, lifecycle, and dependency errors
+        run: |
+          ${{ steps.build-devenv.outputs.path }}/bin/devenv --system ${{ inputs.system }} shell -- \
+            cargo nextest run -p devenv-tasks -p devenv -j 2 --retries 0 \
+              -E 'test(concurrent_dynamic_starts_share_never_started_process_prerequisite) | test(concurrent_start_stop_keeps_explicitly_stopped_dependencies_off) | test(failed_prerequisite_is_visible_under_each_process_with_stopped_filter) | test(disabled_process_root_does_not_select_its_prerequisites) | test(disabled_process_needed_by_a_root_selects_its_prerequisites) | test(api_server_refresh)'
 
       # Exercise the actual terminal boundary on every platform: PTY resize,
       # crossterm key decoding, rendering, and reactive process commands.

@@ -4,10 +4,31 @@
 
 ### Improvements
 
+- `q` now detaches from `devenv processes attach` straight away, leaving the processes running, and detaches from its interrupt prompt too. In a foreground `devenv up`, where quitting stops the processes, `q` opens the quit prompt ([#3264](https://github.com/cachix/devenv/issues/3264)).
 - Added the `tui.emoji` user setting. Set it to `false` to replace the emoji in the interactive shell status line, such as the eye in `devenv watching 11 files`, with non-emoji Unicode glyphs. It defaults to `true`, and the status line stays visible with file watching and automatic reload unchanged.
+- Updating a remote configuration now composes its updated YAML and dependencies before writing `devenv.lock`, so a second invocation is not needed to finish the update.
+- `devenv.yaml` can now compose configuration from remote input imports using the existing `inputs` and `imports` syntax. Remote YAML imports and their transitive inputs are pinned in the importing project's `devenv.lock`; the root project's input declarations retain precedence, allowing shared configurations to reuse a single `nixpkgs` input ([#2205](https://github.com/cachix/devenv/issues/2205)).
 
 ### Bug Fixes
 
+- Fixed a two-second TUI startup delay on terminals that do not answer keyboard capability queries, including during direnv shell activation. Interactive progress remains available for `direnv-export` and `print-dev-env` ([#3169](https://github.com/cachix/devenv/issues/3169)).
+- Foreground `devenv up` now publishes its manager before service readiness, so other `devenv up` calls can detect it during startup. Failed publication cancels setup tasks before cleaning up.
+- Foreground and detached native process startup now share a lock, preventing simultaneous cold starts from overwriting each other's manager socket and PID file. Waiting for the lock can be cancelled, and competing callers preserve the winning manager's proxy routes.
+- Manager PID files are now published atomically, preventing concurrent status checks from treating an incomplete PID as stale and deleting discovery state.
+- Fixed `devenv processes` commands reporting that no process manager is running after `devenv up -d` had been running for more than three days on macOS, where the system `/tmp` cleaner deleted the manager's PID file ([#3316](https://github.com/cachix/devenv/issues/3316)).
+- Fetched `--from` sources now load YAML configuration, local overrides, and YAML imports alongside their Nix modules. Source-local YAML imports are followed, and relative input overrides in the target's `devenv.local.yaml` resolve from the target directory.
+- Locked inputs with complete source metadata now reuse sources from the Nix store or configured binary caches without contacting their original remote, so `devenv shell` works when that remote is unavailable ([#3244](https://github.com/cachix/devenv/pull/3244)).
+- Fixed cold remote YAML imports failing to load fetched sources, and allowed root input follows to reference inputs declared by imported YAML.
+- Fixed remote YAML discovery resolving relative local inputs from the filesystem root instead of the project directory.
+- `devenv inputs add` preserves surrounding YAML comments, formatting, and key order, and no longer copies imported or local inputs into `devenv.yaml` ([#3268](https://github.com/cachix/devenv/issues/3268)).
+- Fixed `languages.rust.lld.enable`, `mold.enable` and `wild.enable` breaking builds for other targets such as `wasm32-unknown-unknown` (for example with Dioxus). They also no longer cause cargo to ignore `[build] rustflags` from the project's `.cargo/config.toml`. The selected linker now applies only to the host target and takes priority over a `[target.<host>] linker` set in `.cargo/config.toml`. `wild.enable` no longer requires the nightly channel on aarch64 Linux.
+- Fixed machine metadata failing to load when encryption key or extra file target paths contain dots, such as `/tmp/luks.key` ([#3277](https://github.com/cachix/devenv/issues/3277)).
+- Fixed source builds with Meson 1.12, missing syscall declarations in static Linux builds, and Linux linking failures caused by malformed Ghostty compiler-runtime objects.
+- Restore terminal settings after tasks exit or are killed, preventing subsequent terminal output from remaining misaligned ([#3292](https://github.com/cachix/devenv/issues/3292)).
+- Fixed `devenv shell` keybindings (Ctrl-Alt-D/W/E by default) not working while the foreground program, such as fish 4 or Claude Code, has enabled the kitty keyboard protocol or xterm modifyOtherKeys ([#3294](https://github.com/cachix/devenv/issues/3294)).
+- Updated bundled Nix to 2.35.3 with upstream security fixes ([#3287](https://github.com/cachix/devenv/issues/3287)).
+- Failed process prerequisites and their error output now remain visible in the TUI, including shared prerequisites and when stopped processes are hidden ([#3017](https://github.com/cachix/devenv/issues/3017)). Processes with more than five prerequisites also show the full task list.
+- Fixed `devenv shell` printing `bash: export: … not a valid identifier` and truncating `PATH` at the first space when a task re-exports `PATH` (for example Python venv activation) and the parent `PATH` contains a directory with a space ([#3165](https://github.com/cachix/devenv/issues/3165)).
 - Task cancellation now stops status checks and waits for nested commands to stop before the scheduler exits ([#3251](https://github.com/cachix/devenv/issues/3251)).
 - Fixed rapid process restarts failing because a stopped process still held its ownership claim.
 - Starting a process on demand now starts never-started, enabled process dependencies. Explicitly stopped and disabled dependencies stay off ([#3229](https://github.com/cachix/devenv/issues/3229)).
@@ -16,8 +37,16 @@
 - MySQL now creates configured databases and users when started with `devenv up`, including `devenv up mysql` ([#2843](https://github.com/cachix/devenv/issues/2843)).
 - fish auto-activation no longer hangs when `env` is a fish function, such as grc's wrapper; `cat`, `rm` and `devenv` functions are bypassed too ([#3222](https://github.com/cachix/devenv/issues/3222)).
 - Task names containing `::`, such as `foo::bar`, are now rejected with an invalid task name error. Previously they were accepted but could not be run by name ([#3227](https://github.com/cachix/devenv/issues/3227)).
+- `devenv shell` no longer reloads in an endless loop, and configurations that read the project directory (such as `lib.fileset.fromSource ./.`) no longer rebuild on every run because of files devenv writes under `.devenv/`. Changes to files in `.devenv/state/` still trigger a reload.
 - Detached process startup now publishes the manager as soon as processes are scheduled, without waiting for service readiness, and keeps HTTPS proxy routes during a slow startup ([#3216](https://github.com/cachix/devenv/issues/3216)).
 - `devenv test` with the native process manager now reports a process dependency on `start.enable = false` before starting services, instead of waiting indefinitely for the disabled process ([#3215](https://github.com/cachix/devenv/issues/3215)).
+- Fixed auto-activation starting the devenv shell at the project root when you `cd` into a subdirectory. The shell now starts in the directory you entered, like `devenv shell` run from that directory ([#3041](https://github.com/cachix/devenv/issues/3041)).
+- `devenv shell` no longer hangs when the file watcher cannot start, for example when the inotify instance limit (`fs.inotify.max_user_instances`) is reached. The shell now starts without hot reload ([#3281](https://github.com/cachix/devenv/issues/3281)).
+- `devenv test` now honours `strict_ports: true` and fails on a port conflict, as `devenv up` does, instead of silently moving the service to the next free port ([#3163](https://github.com/cachix/devenv/issues/3163)).
+- `enterShell` now runs from the project root when `devenv shell` starts in a subdirectory, before the shell moves to that subdirectory. Previously it ran in the subdirectory, so commands with relative paths, such as the JavaScript package install, looked in the wrong place.
+- Fixed auto-activation waiting for the next prompt when you `cd` from one devenv project directly into another, so you had to press Enter before the second project's shell started. It now starts right away ([#3129](https://github.com/cachix/devenv/issues/3129)).
+- `devenv up` and `devenv test` no longer run the prerequisites of a process with `start.enable = false`. They now run when that process is started, or when an enabled process depends on it ([#3272](https://github.com/cachix/devenv/issues/3272)).
+- Fixed `languages.javascript.npm.install.enable` corrupting `node_modules` when several shells start at once. Concurrent shells now wait for one npm install to finish instead of running their own.
 
 ## 2.4.0 (2026-09-24)
 

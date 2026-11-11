@@ -9,7 +9,7 @@ pub mod owner;
 // Re-export the generic reload engine so callers use a single `reload` namespace.
 pub use devenv_reload::{Config, ShellCoordinator};
 
-use crate::devenv::{format_shell_exports, resolve_shell_path};
+use crate::devenv::{format_shell_exports, push_shell_fragment, resolve_shell_path};
 use devenv_core::config::Clean;
 use devenv_reload::{BuildContext, BuildError, CommandBuilder, ShellBuilder};
 use devenv_shell::dialect::{BashDialect, RcfileContext, ShellDialect, create_dialect};
@@ -42,8 +42,8 @@ pub struct DevenvShellBuilder {
     /// (`getpwuid`). When present and the path exists, used directly instead
     /// of `resolve_shell_path` so stripped environments still find the shell.
     pub shell_path: Option<PathBuf>,
-    /// Directory to start the interactive shell in. Set when the project root
-    /// was discovered in a parent directory; `None` uses the build context cwd.
+    /// Directory the interactive shell moves to once its environment is set
+    /// up. Set when the project root was discovered in a parent directory.
     pub shell_cwd: Option<PathBuf>,
     pub shell_keybindings: ShellKeybindings,
 }
@@ -86,8 +86,12 @@ impl DevenvShellBuilder {
         // (e.g. VIRTUAL_ENV, PATH from venv override the Nix-provided ones).
         let env_script_path = self.dotfile.join("shell-env.sh");
         let mut env_script = self.initial_env_script.clone();
-        env_script.push_str(&format_shell_exports(&self.task_exports));
-        env_script.push_str(&BashDialect.format_task_messages(&self.task_messages));
+        push_shell_fragment(&mut env_script, &format_shell_exports(&self.task_exports));
+        push_shell_fragment(
+            &mut env_script,
+            &BashDialect.format_task_messages(&self.task_messages),
+        );
+        push_shell_fragment(&mut env_script, crate::shell_env::CD_INTO_SHELL_CWD);
         write_file(&env_script_path, &env_script, "env script")?;
 
         tracing::trace!("Shell setting: {:?}", self.shell);
@@ -139,11 +143,16 @@ impl DevenvShellBuilder {
             cmd_builder.arg(arg);
         }
 
-        cmd_builder.cwd(self.shell_cwd.as_deref().unwrap_or(&ctx.cwd));
+        cmd_builder.cwd(&ctx.cwd);
         set_reload_file_env(&mut cmd_builder, ctx);
 
         let shell_for_env = target_shell_path.as_deref().unwrap_or(bash);
-        crate::shell_env::apply_shell_env(&mut cmd_builder, shell_for_env, &self.clean);
+        crate::shell_env::apply_shell_env(
+            &mut cmd_builder,
+            shell_for_env,
+            &self.clean,
+            self.shell_cwd.as_deref(),
+        );
 
         Ok(cmd_builder)
     }

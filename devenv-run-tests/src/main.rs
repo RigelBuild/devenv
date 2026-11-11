@@ -316,7 +316,7 @@ impl TestConfig {
                 let content = fs::read_to_string(config_path)
                     .into_diagnostic()
                     .wrap_err("Failed to read .test-config file")?;
-                return serde_yaml::from_str(&content)
+                return serde_norway::from_str(&content)
                     .into_diagnostic()
                     .wrap_err("Failed to parse .test-config YAML");
             }
@@ -580,25 +580,21 @@ async fn run_tests_in_directory(args: &RunArgs) -> Result<Vec<TestResult>> {
             Err(error)
         } else if test_config.use_shell {
             // Now load config from the current directory (which might be temp dir)
-            let mut config = Config::load_from(&devenv_root)?;
-            for input in args.override_inputs.chunks_exact(2) {
-                config
-                    .override_input_url(&input[0], &input[1])
-                    .wrap_err(format!(
-                        "Failed to override input {} with {}",
-                        &input[0], &input[1]
-                    ))?;
-            }
+            let devenv_input_url = format!("git+file:{}?dir=src/modules", cwd.display());
+            let mut project = devenv_nix_backend::project::ProjectConfig::new(&devenv_root);
+            project.input_overrides = args.override_inputs.clone();
+            let mut test_inputs = Config::default();
+            test_inputs.add_input("devenv", &devenv_input_url, &[])?;
+            project.extra_inputs = test_inputs.inputs;
+            let resolved = devenv_nix_backend::project::resolve_project(
+                &project,
+                Default::default(),
+                devenv_nix_backend::project::UpdatePolicy::Preserve,
+            )?;
+            resolved.write_lock()?;
+            let config = resolved.config;
 
-            // Override the input for the devenv module
-            config
-                .add_input(
-                    "devenv",
-                    &format!("git+file:{}?dir=src/modules", cwd.display()),
-                    &[],
-                )
-                .wrap_err("Failed to add devenv input")?;
-
+            let strict_ports = config.strict_ports.unwrap_or(false);
             let nix_settings = NixSettings {
                 backend: config.backend.clone(),
                 ..NixSettings::default()
@@ -636,7 +632,9 @@ async fn run_tests_in_directory(args: &RunArgs) -> Result<Vec<TestResult>> {
                 }
             }
 
-            devenv.test(devenv::VerbosityLevel::Normal).await
+            devenv
+                .test(devenv::VerbosityLevel::Normal, strict_ports)
+                .await
         } else {
             // Run .test.sh directly - it must exist when run_test_sh is false
             if PathBuf::from(".test.sh").exists() {
@@ -1233,11 +1231,11 @@ mod tests {
 
     #[test]
     fn test_config_accepts_size_strings_and_bytes() {
-        let config: TestConfig = serde_yaml::from_str("max_closure_size: 2 GB").unwrap();
+        let config: TestConfig = serde_norway::from_str("max_closure_size: 2 GB").unwrap();
         assert_eq!(config.max_closure_size, Some(2_000_000_000));
-        let config: TestConfig = serde_yaml::from_str("max_closure_size: 4096").unwrap();
+        let config: TestConfig = serde_norway::from_str("max_closure_size: 4096").unwrap();
         assert_eq!(config.max_closure_size, Some(4096));
-        let config: TestConfig = serde_yaml::from_str("use_shell: false").unwrap();
+        let config: TestConfig = serde_norway::from_str("use_shell: false").unwrap();
         assert_eq!(config.max_closure_size, None);
     }
 

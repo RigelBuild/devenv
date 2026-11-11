@@ -44,7 +44,7 @@ pub enum UserConfigError {
     #[diagnostic(code(devenv::user_config::serialize))]
     Serialize {
         #[source]
-        source: serde_yaml::Error,
+        source: serde_norway::Error,
     },
 }
 
@@ -72,10 +72,10 @@ impl Default for UserConfig {
 impl UserConfig {
     pub fn from_yaml(path: impl AsRef<Path>, input: String) -> Result<Self, UserConfigError> {
         let path = path.as_ref();
-        if let Err(error) = serde_yaml::from_str::<serde_yaml::Value>(&input) {
+        if let Err(error) = serde_norway::from_str::<serde_norway::Value>(&input) {
             return Err(parse_error(path, input, error));
         }
-        let parsed = serde_yaml::from_str::<Self>(&input)
+        let parsed = serde_norway::from_str::<Self>(&input)
             .map_err(|error| parse_error(path, input, error))?;
         parsed.validate()?;
         Ok(parsed)
@@ -107,7 +107,7 @@ impl UserConfig {
     }
 
     pub fn to_yaml(&self) -> Result<String, UserConfigError> {
-        serde_yaml::to_string(self)
+        serde_norway::to_string(self)
             .map(|config| {
                 format!("# yaml-language-server: $schema={USER_CONFIG_SCHEMA_URL}\n\n{config}")
             })
@@ -180,7 +180,7 @@ impl ShellPreferences {
     }
 }
 
-fn parse_error(path: &Path, input: String, error: serde_yaml::Error) -> UserConfigError {
+fn parse_error(path: &Path, input: String, error: serde_norway::Error) -> UserConfigError {
     let span = error.location().map(|location| {
         let offset = location.index().min(input.len().saturating_sub(1));
         (offset, usize::from(!input.is_empty())).into()
@@ -1056,6 +1056,7 @@ fn actions_for(context: KeyContext) -> &'static [Action] {
             Action::StopProcess,
             Action::ToggleStopped,
             Action::Cancel,
+            Action::Quit,
         ],
         KeyContext::ProcessSearch => &[
             Action::NextMatch,
@@ -1408,6 +1409,7 @@ fn default_bindings() -> Vec<(KeyContext, Action, Vec<&'static str>)> {
         (Main, StopProcess, vec!["ctrl+x"]),
         (Main, ToggleStopped, vec!["ctrl+h"]),
         (Main, Cancel, vec!["esc"]),
+        (Main, Quit, vec!["q"]),
         (ProcessSearch, NextMatch, vec!["down"]),
         (ProcessSearch, PreviousMatch, vec!["up"]),
         (ProcessSearch, Accept, vec!["enter"]),

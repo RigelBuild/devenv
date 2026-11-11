@@ -27,6 +27,8 @@ mod gc_store;
 mod file_limit;
 
 pub mod lock;
+pub mod project;
+pub mod source;
 
 pub mod primops;
 pub use primops::{
@@ -66,6 +68,62 @@ pub mod umask_guard;
 // Helpers for shaping Nix errors into miette diagnostics
 mod error;
 
+fn create_flake_input_base(
+    fetch_settings: &FetchersSettings,
+    flake_settings: &FlakeSettings,
+    parse_flags: &FlakeReferenceParseFlags,
+    input: &Input,
+) -> Result<Option<FlakeInput>> {
+    let (flake_ref, is_flake) = if let Some(url) = &input.url {
+        let (flake_ref, _fragment) =
+            FlakeReference::parse_with_fragment(fetch_settings, flake_settings, parse_flags, url)?;
+        (flake_ref, input.flake)
+    } else if let Some(follows_target) = &input.follows {
+        let (placeholder_ref, _) = FlakeReference::parse_with_fragment(
+            fetch_settings,
+            flake_settings,
+            parse_flags,
+            follows_target,
+        )?;
+        (placeholder_ref, true)
+    } else {
+        return Ok(None);
+    };
+
+    let mut flake_input = FlakeInput::new(&flake_ref, is_flake)?;
+    if let Some(follows_path) = &input.follows {
+        flake_input.set_follows(follows_path)?;
+    }
+    Ok(Some(flake_input))
+}
+
+fn create_flake_input(
+    fetch_settings: &FetchersSettings,
+    flake_settings: &FlakeSettings,
+    parse_flags: &FlakeReferenceParseFlags,
+    input: &Input,
+) -> Result<Option<FlakeInput>> {
+    let Some(mut flake_input) =
+        create_flake_input_base(fetch_settings, flake_settings, parse_flags, input)?
+    else {
+        return Ok(None);
+    };
+
+    if !input.inputs.is_empty() {
+        let mut overrides = FlakeInputs::new()?;
+        for (nested_name, nested_input) in &input.inputs {
+            if let Some(nested_flake_input) =
+                create_flake_input_base(fetch_settings, flake_settings, parse_flags, nested_input)?
+            {
+                overrides.add(nested_name, nested_flake_input)?;
+            }
+        }
+        flake_input.set_overrides(overrides)?;
+    }
+
+    Ok(Some(flake_input))
+}
+
 /// Convert devenv inputs to FlakeInputs
 ///
 /// # Arguments
@@ -83,78 +141,12 @@ pub fn create_flake_inputs(
     // Preserve relative paths so they can be resolved during locking via source_path context
     parse_flags.set_preserve_relative_paths(true)?;
 
-    // Convert each devenv input to a FlakeInput
-    for (name, input) in inputs.iter() {
-        let mut flake_input = if let Some(url) = &input.url {
-            let (flake_ref, _fragment) = FlakeReference::parse_with_fragment(
-                fetch_settings,
-                flake_settings,
-                &parse_flags,
-                url,
-            )?;
-            FlakeInput::new(&flake_ref, input.flake)?
-        } else if let Some(follows_target) = &input.follows {
-            // Top-level input has only follows - use follows target as placeholder reference
-            // (the reference gets cleared internally by set_follows)
-            let (placeholder_ref, _) = FlakeReference::parse_with_fragment(
-                fetch_settings,
-                flake_settings,
-                &parse_flags,
-                follows_target,
-            )?;
-            FlakeInput::new(&placeholder_ref, true)?
-        } else {
-            continue;
-        };
-
-        // Set follows relationship before adding to collection
-        // (C API does not support modifying inputs after they're added)
-        if let Some(follows_path) = &input.follows {
-            flake_input.set_follows(follows_path)?;
+    for (name, input) in inputs {
+        if let Some(flake_input) =
+            create_flake_input(fetch_settings, flake_settings, &parse_flags, input)?
+        {
+            flake_inputs.add(name, flake_input)?;
         }
-
-        // Handle nested input overrides (e.g., git-hooks.inputs.nixpkgs.follows = "nixpkgs")
-        if !input.inputs.is_empty() {
-            let mut overrides = FlakeInputs::new()?;
-
-            for (nested_name, nested_input) in input.inputs.iter() {
-                let mut nested_flake_input = if let Some(nested_url) = &nested_input.url {
-                    // Nested input has a URL - parse it
-                    let (nested_ref, _) = FlakeReference::parse_with_fragment(
-                        fetch_settings,
-                        flake_settings,
-                        &parse_flags,
-                        nested_url,
-                    )?;
-                    FlakeInput::new(&nested_ref, nested_input.flake)?
-                } else if let Some(follows_target) = &nested_input.follows {
-                    // Nested input has only follows - use follows target as placeholder reference
-                    // (the reference gets cleared internally by set_follows)
-                    let (placeholder_ref, _) = FlakeReference::parse_with_fragment(
-                        fetch_settings,
-                        flake_settings,
-                        &parse_flags,
-                        follows_target,
-                    )?;
-                    FlakeInput::new(&placeholder_ref, true)?
-                } else {
-                    // Nested input has neither URL nor follows - skip it
-                    continue;
-                };
-
-                // Set follows if specified
-                if let Some(follows_path) = &nested_input.follows {
-                    nested_flake_input.set_follows(follows_path)?;
-                }
-
-                overrides.add(nested_name, nested_flake_input)?;
-            }
-
-            // Set the overrides on the parent input
-            flake_input.set_overrides(overrides)?;
-        }
-
-        flake_inputs.add(name, flake_input)?;
     }
 
     // Add nixpkgs as a default input if not already specified
@@ -184,6 +176,41 @@ pub fn create_flake_inputs(
     }
 
     Ok(flake_inputs)
+}
+
+/// Lock one source input in memory without adding default inputs or writing a lock file.
+pub fn lock_source_input(
+    eval_state: &EvalState,
+    fetch_settings: &FetchersSettings,
+    flake_settings: &FlakeSettings,
+    root: &Path,
+    old_lock: Option<&LockFile>,
+    source_input: &Input,
+    refresh: bool,
+) -> Result<LockFile> {
+    let mut parse_flags = FlakeReferenceParseFlags::new(flake_settings)?;
+    parse_flags.set_preserve_relative_paths(true)?;
+
+    let source_input =
+        create_flake_input(fetch_settings, flake_settings, &parse_flags, source_input)?
+            .context("Source input requires a URL or follows target")?;
+    let mut flake_inputs = FlakeInputs::new()?;
+    flake_inputs.add("from", source_input)?;
+
+    let updates = if refresh {
+        vec!["from".into()]
+    } else {
+        Vec::new()
+    };
+    lock_flake_inputs(
+        eval_state,
+        fetch_settings,
+        flake_settings,
+        root,
+        flake_inputs,
+        old_lock,
+        &updates,
+    )
 }
 
 /// Load an existing lock file if it exists
@@ -344,29 +371,15 @@ pub fn validate_lock_file(
         );
     };
 
-    let flake_inputs = create_flake_inputs(fetch_settings, flake_settings, inputs)
-        .context("Failed to create flake inputs")?;
-
-    let source_path = root.join("devenv.nix");
-    let source_path_str = source_path
-        .to_str()
-        .context("Source path contains invalid UTF-8")?;
-
-    // Virtual mode so unlocked local inputs don't fail validation;
-    // we compare the computed lock against the existing one to detect drift.
-    let locker = InputsLocker::new(flake_settings)
-        .with_inputs(flake_inputs)
-        .source_path(source_path_str)
-        .old_lock_file(&old_lock)
-        .mode(LockMode::Virtual)
-        .use_registries(true);
-
-    let lock_result = {
-        let _guard = crate::umask_guard::UmaskGuard::restrictive();
-        locker.lock(fetch_settings, eval_state)
-    };
-
-    let new_lock = lock_result.context("Lock validation failed")?;
+    let new_lock = resolve_lock_file(
+        eval_state,
+        fetch_settings,
+        flake_settings,
+        root,
+        inputs,
+        Some(&old_lock),
+        &[],
+    )?;
     if new_lock.has_changes(&old_lock)? {
         tracing::debug!("Lock validation found changes, writing updated lock");
         // Writing new_lock directly avoids re-fetching every input: it was
@@ -374,6 +387,65 @@ pub fn validate_lock_file(
         write_lock_file(&new_lock, lock_file_path).context("Failed to write lock file")?;
     }
     Ok(())
+}
+
+/// Resolve `inputs` to a lock graph in memory, using `old_lock` to preserve
+/// existing pins. The caller decides when the graph is complete and should be
+/// written to disk.
+pub(crate) fn resolve_lock_file(
+    eval_state: &EvalState,
+    fetch_settings: &FetchersSettings,
+    flake_settings: &FlakeSettings,
+    root: &Path,
+    inputs: &BTreeMap<String, Input>,
+    old_lock: Option<&LockFile>,
+    updates: &[String],
+) -> Result<LockFile> {
+    let flake_inputs = create_flake_inputs(fetch_settings, flake_settings, inputs)
+        .context("Failed to create flake inputs")?;
+    lock_flake_inputs(
+        eval_state,
+        fetch_settings,
+        flake_settings,
+        root,
+        flake_inputs,
+        old_lock,
+        updates,
+    )
+}
+
+/// Lock an explicit set of flake inputs. Default project inputs are supplied
+/// by the caller so source discovery can lock only `from`.
+fn lock_flake_inputs(
+    eval_state: &EvalState,
+    fetch_settings: &FetchersSettings,
+    flake_settings: &FlakeSettings,
+    root: &Path,
+    flake_inputs: FlakeInputs,
+    old_lock: Option<&LockFile>,
+    updates: &[String],
+) -> Result<LockFile> {
+    let source_path = root.join("devenv.nix");
+    let source_path_str = source_path
+        .to_str()
+        .context("Source path contains invalid UTF-8")?;
+
+    // Virtual mode lets config composition discover every imported input
+    // before committing the resulting graph to devenv.lock.
+    let mut locker = InputsLocker::new(flake_settings)
+        .with_inputs(flake_inputs)
+        .source_path(source_path_str)
+        .mode(LockMode::Virtual)
+        .use_registries(true)
+        .update_inputs(updates.iter().cloned());
+    if let Some(old_lock) = old_lock {
+        locker = locker.old_lock_file(old_lock);
+    }
+
+    let _guard = crate::umask_guard::UmaskGuard::restrictive();
+    locker
+        .lock(fetch_settings, eval_state)
+        .context("Lock validation failed")
 }
 
 /// Compute a content fingerprint from all locked inputs' fingerprints.

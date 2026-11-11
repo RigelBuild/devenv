@@ -556,6 +556,17 @@ impl Tasks {
         }
     }
 
+    /// Whether a node is a process with `start.enable = false`.
+    async fn is_disabled_process(&self, node: NodeIndex) -> bool {
+        let state = self.graph[node].read().await;
+        state.task.r#type == TaskType::Process
+            && state
+                .task
+                .process
+                .as_ref()
+                .is_some_and(|process| !process.start.enable)
+    }
+
     #[instrument(skip(self), fields(graph, subgraph), ret)]
     async fn schedule(&mut self) -> Result<Vec<NodeIndex>, Error> {
         let mut subgraph = DiGraph::new();
@@ -573,20 +584,29 @@ impl Tasks {
             // never selects unrelated dependents.
             // See: https://github.com/cachix/devenv/issues/2337
             let mut activated = HashSet::new();
+            let mut expanded = HashSet::new();
             let mut to_visit: Vec<(NodeIndex, bool)> =
                 self.roots.iter().map(|&root| (root, true)).collect();
             while let Some((node, active)) = to_visit.pop() {
-                if visited.insert(node) {
-                    if let Some(wanted) = self.wants.get(&node) {
-                        to_visit.extend(wanted.iter().map(|&task| (task, true)));
-                    }
-                    if upstream {
-                        to_visit.extend(
-                            self.graph
-                                .neighbors_directed(node, petgraph::Direction::Incoming)
-                                .map(|prerequisite| (prerequisite, false)),
-                        );
-                    }
+                if visited.insert(node)
+                    && let Some(wanted) = self.wants.get(&node)
+                {
+                    to_visit.extend(wanted.iter().map(|&task| (task, true)));
+                }
+                // A process with `start.enable = false` does not start on its
+                // own, so selecting it does not pull in its prerequisites; they
+                // run when the process is started. Reaching it as a
+                // prerequisite of a selected task still does.
+                // See: https://github.com/cachix/devenv/issues/3272
+                if upstream
+                    && (!active || !self.is_disabled_process(node).await)
+                    && expanded.insert(node)
+                {
+                    to_visit.extend(
+                        self.graph
+                            .neighbors_directed(node, petgraph::Direction::Incoming)
+                            .map(|prerequisite| (prerequisite, false)),
+                    );
                 }
                 if active && downstream && activated.insert(node) {
                     to_visit.extend(
@@ -1385,32 +1405,6 @@ impl Tasks {
             task_ids.insert(index, next_id());
         }
 
-        // Build TaskInfo for all tasks
-        let mut task_infos: Vec<TaskInfo> = Vec::new();
-        for &index in &self.tasks_order {
-            let task_state = self.graph[index].read().await;
-            let task_id = task_ids[&index];
-
-            task_infos.push(TaskInfo {
-                id: task_id,
-                name: task_state.task.name.clone(),
-                show_output: task_state.task.show_output,
-                is_process: task_state.task.r#type == crate::types::TaskType::Process,
-            });
-        }
-
-        // Compute hierarchy edges using the extracted function
-        let edges = compute_hierarchy_edges(
-            &self.graph,
-            &self.tasks_order,
-            &self.roots,
-            &task_ids,
-            orchestration_activity.id(),
-        );
-
-        // Emit hierarchy once upfront
-        emit_task_hierarchy(task_infos, edges);
-
         let total_tasks = self.tasks_order.len() as u64;
         let completed_tasks = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let scheduled: HashSet<NodeIndex> = self.tasks_order.iter().copied().collect();
@@ -1492,6 +1486,41 @@ impl Tasks {
                 }
             }
         }
+
+        // Process registration creates the actual TUI activities. Use those
+        // IDs as dependency parents rather than the unused process-task IDs.
+        let mut display_ids = HashMap::new();
+        let mut task_infos = Vec::new();
+        for &index in &self.tasks_order {
+            let state = self.graph[index].read().await;
+            let is_process = state.task.r#type == TaskType::Process;
+            let id = if is_process {
+                let name = crate::types::process_name(&state.task.name);
+                let Some(id) = self.process_runner.activity_id(name).await else {
+                    // Failed registration leaves no process parent. Its
+                    // prerequisites fall back to the orchestration activity.
+                    continue;
+                };
+                id
+            } else {
+                task_ids[&index]
+            };
+            display_ids.insert(index, id);
+            task_infos.push(TaskInfo {
+                id,
+                name: state.task.name.clone(),
+                show_output: state.task.show_output,
+                is_process,
+            });
+        }
+        let edges = compute_hierarchy_edges(
+            &self.graph,
+            &self.tasks_order,
+            &self.roots,
+            &display_ids,
+            orchestration_activity.id(),
+        );
+        emit_task_hierarchy(task_infos, edges);
 
         for index in &self.tasks_order {
             let task_state = &self.graph[*index];
@@ -2275,6 +2304,78 @@ mod schedule_tests {
                 "{mode:?}"
             );
         }
+    }
+
+    /// A long-running process with `start.enable = false` that runs after `after`.
+    fn disabled_process_after(name: &str, after: &str) -> TaskConfig {
+        let mut task = long_process_task(name, vec![]);
+        task.after = vec![after.to_string()];
+        task.process = Some(ProcessConfig {
+            start: devenv_processes::config::StartConfig { enable: false },
+            ..Default::default()
+        });
+        task
+    }
+
+    #[tokio::test]
+    async fn disabled_process_root_does_not_select_its_prerequisites() {
+        let configs = vec![
+            oneshot_task("fixture:prepare", vec![]),
+            disabled_process_after("optional", "fixture:prepare"),
+            long_process_task("app", vec![]),
+        ];
+        for mode in [RunMode::Before, RunMode::All] {
+            let (tasks, _tmp) = build_test_tasks_with_run_mode(
+                configs.clone(),
+                vec![
+                    format!("{PROCESS_TASK_PREFIX}optional"),
+                    format!("{PROCESS_TASK_PREFIX}app"),
+                ],
+                mode,
+                false,
+            )
+            .await;
+            let mut names = task_names(&tasks).await;
+            names.sort();
+            assert_eq!(
+                names,
+                vec![
+                    format!("{PROCESS_TASK_PREFIX}app"),
+                    format!("{PROCESS_TASK_PREFIX}optional"),
+                ],
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_process_needed_by_a_root_selects_its_prerequisites() {
+        let configs = vec![
+            oneshot_task("fixture:prepare", vec![]),
+            disabled_process_after("optional", "fixture:prepare"),
+            long_process_task("app", vec!["optional@started"]),
+        ];
+        // Visit the disabled process as a root before reaching it through `app`.
+        let (tasks, _tmp) = build_test_tasks_with_run_mode(
+            configs,
+            vec![
+                format!("{PROCESS_TASK_PREFIX}app"),
+                format!("{PROCESS_TASK_PREFIX}optional"),
+            ],
+            RunMode::Before,
+            false,
+        )
+        .await;
+        let mut names = task_names(&tasks).await;
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                format!("{PROCESS_TASK_PREFIX}app"),
+                format!("{PROCESS_TASK_PREFIX}optional"),
+                "fixture:prepare".to_string(),
+            ]
+        );
     }
 
     #[tokio::test]
