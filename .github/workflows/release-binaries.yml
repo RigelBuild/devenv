@@ -52,7 +52,7 @@ jobs:
           else
             tag="$REF_NAME"
           fi
-          [[ "$tag" =~ ^v[0-9][A-Za-z0-9._-]*$ ]] || { echo "error: invalid tag: $tag" >&2; exit 1; }
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rigel\.[0-9]+$ ]] || { echo "error: tag must be vX.Y.Z-rigel.N, got: $tag" >&2; exit 1; }
           {
             echo "tag=${tag}"
             echo "version=${tag#v}"
@@ -62,15 +62,17 @@ jobs:
         with:
           ref: ${{ steps.tag.outputs.tag }}
 
-      # The binary reports the workspace version, so the tag must name it.
-      - name: Check tag matches the workspace version
+      # The binary reports the upstream base version, so the tag's base (before
+      # the -rigel.N fork suffix) must name the Cargo workspace version.
+      - name: Check tag base matches the workspace version
         env:
           VERSION: ${{ steps.tag.outputs.version }}
         run: |
           set -euo pipefail
+          base="${VERSION%%-rigel.*}"
           cargo_version="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
-          if [ "$cargo_version" != "$VERSION" ]; then
-            echo "error: tag v$VERSION does not match Cargo.toml version $cargo_version" >&2
+          if [ "$cargo_version" != "$base" ]; then
+            echo "error: tag base $base does not match Cargo.toml version $cargo_version" >&2
             exit 1
           fi
 
@@ -137,7 +139,7 @@ jobs:
                 esac
               done <<<"$deps"
               if grep -q '/nix/store' <<<"$loads"; then fail "binary load commands reference /nix/store"; fi
-              if grep -q '@rpath\|@loader_path' <<<"$loads"; then fail "binary uses @rpath or @loader_path"; fi
+              if grep -qE '@rpath|@loader_path' <<<"$loads"; then fail "binary uses @rpath or @loader_path"; fi
               ;;
             *) fail "unsupported build host: $(uname -s)" ;;
           esac
