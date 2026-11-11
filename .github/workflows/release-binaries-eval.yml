@@ -1,0 +1,29 @@
+name: "Release Binaries Eval"
+
+# Evaluates the release target without compiling it. A broken flake output
+# fails here on the PR, not on the tag that would publish it.
+
+on:
+  pull_request:
+
+concurrency:
+  group: release-binaries-eval-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  eval:
+    name: Eval devenv-static-unwrapped
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+
+      # Evaluation only: `--raw .drvPath` reads the derivation path without
+      # realising any output, so no source build runs.
+      - name: Evaluate release target
+        run: nix eval --raw .#devenv-static-unwrapped.drvPath
