@@ -6,9 +6,9 @@ default_branch = "rigel-release"
 hooks {
     ["pre-push"] {
         steps {
-            ["release-workflow-yaml"] = new Step {
+            ["release-workflows-lint"] = new Step {
                 glob = List(".github/workflows/release-binaries*.yml")
-                check = "yq -e '.jobs | keys' {{files}} >/dev/null"
+                check = "nix shell nixpkgs#actionlint --command actionlint {{files}}"
             }
         }
     }

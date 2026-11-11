@@ -1,8 +1,12 @@
 name: "Release Binaries"
 
 # Publishes the devenv CLI as a static, relocatable binary per platform to a
-# GitHub Release on every version tag. Each build uses the flake output
+# GitHub Release for each version tag. Each build uses the flake output
 # devenv-static-unwrapped, which build.yml already exercises upstream.
+#
+# A published release is immutable: publish refuses to overwrite assets that
+# are already on it. Tarballs are not byte-reproducible, so a rebuild changes
+# every hash. Recover a half-published release by deleting it and re-running.
 #
 # Hosts consume these assets through a fork flake package. Its pinned hashes
 # can only exist after the first tag publishes the assets, so that package
@@ -16,7 +20,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to (re-)build a release for"
+        description: "Existing tag to build a release for"
         required: true
         type: string
 
@@ -30,12 +34,11 @@ permissions:
 jobs:
   meta:
     name: Compute release metadata
-    runs-on: ubuntu-latest
-    timeout-minutes: 2
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
       version: ${{ steps.tag.outputs.version }}
-      prerelease: ${{ steps.tag.outputs.prerelease }}
     steps:
       - id: tag
         env:
@@ -50,17 +53,26 @@ jobs:
             tag="$REF_NAME"
           fi
           [[ "$tag" =~ ^v[0-9][A-Za-z0-9._-]*$ ]] || { echo "error: invalid tag: $tag" >&2; exit 1; }
-          version="${tag#v}"
-          if [[ "$tag" == *-* ]]; then
-            prerelease=true
-          else
-            prerelease=false
-          fi
           {
             echo "tag=${tag}"
-            echo "version=${version}"
-            echo "prerelease=${prerelease}"
+            echo "version=${tag#v}"
           } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      # The binary reports the workspace version, so the tag must name it.
+      - name: Check tag matches the workspace version
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          cargo_version="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          if [ "$cargo_version" != "$VERSION" ]; then
+            echo "error: tag v$VERSION does not match Cargo.toml version $cargo_version" >&2
+            exit 1
+          fi
 
   build:
     name: Build (${{ matrix.slug }})
@@ -70,9 +82,9 @@ jobs:
       matrix:
         include:
           - slug: darwin-arm64
-            runs-on: macos-latest
+            runs-on: macos-15
           - slug: linux-amd64
-            runs-on: ubuntu-latest
+            runs-on: ubuntu-24.04
           - slug: linux-arm64
             runs-on: ubuntu-24.04-arm
     runs-on: ${{ matrix.runs-on }}
@@ -93,8 +105,46 @@ jobs:
       - name: Build devenv-static-unwrapped
         run: nix build -L --show-trace .#devenv-static-unwrapped
 
+      # Relocatable means the binary needs nothing from the build host: no
+      # dynamic loader, no Nix store library, no Nix store rpath. The Linux
+      # build is static, so it has no interpreter and no DT_NEEDED entries.
+      # The macOS build may link only system libraries.
+      - name: Check the binary is relocatable
+        run: |
+          set -euo pipefail
+          bin="result/bin/devenv"
+          fail() { echo "error: $*" >&2; exit 1; }
+          case "$(uname -s)" in
+            Linux)
+              phdrs="$(readelf -lW "$bin")"
+              dyn="$(readelf -dW "$bin")"
+              if grep -q 'INTERP' <<<"$phdrs"; then fail "binary has a PT_INTERP loader"; fi
+              if grep -q 'NEEDED' <<<"$dyn"; then fail "binary has DT_NEEDED entries"; fi
+              if grep -q '/nix/store' <<<"$dyn"; then fail "binary has a /nix/store RUNPATH"; fi
+              ;;
+            Darwin)
+              deps="$(otool -L "$bin")"
+              loads="$(otool -l "$bin")"
+              while IFS= read -r dep; do
+                case "$dep" in
+                  *:) continue ;; # the `otool -L` header line names the binary
+                  "") continue ;;
+                esac
+                path="$(sed 's/^[[:space:]]*//; s/ (.*//' <<<"$dep")"
+                case "$path" in
+                  /usr/lib/*|/System/*) ;;
+                  *) fail "dynamic dependency outside /usr/lib and /System: $path" ;;
+                esac
+              done <<<"$deps"
+              if grep -q '/nix/store' <<<"$loads"; then fail "binary load commands reference /nix/store"; fi
+              if grep -q '@rpath\|@loader_path' <<<"$loads"; then fail "binary uses @rpath or @loader_path"; fi
+              ;;
+            *) fail "unsupported build host: $(uname -s)" ;;
+          esac
+
       # Smoke-run the binary before packing, so a broken build never reaches
-      # a release.
+      # a release. This runs on a host with /nix/store, so it does not prove
+      # relocatability; the check above does.
       - name: Stage, smoke-test, and pack
         env:
           VER: ${{ needs.meta.outputs.version }}
@@ -126,7 +176,7 @@ jobs:
   publish:
     name: Publish GitHub Release
     needs: [meta, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write
@@ -137,28 +187,28 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Create or refresh GitHub Release
+      # Never overwrite: an existing asset means this tag was already
+      # published, and its bytes must not change under consumers.
+      - name: Publish release assets without overwriting
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.meta.outputs.tag }}
-          PRERELEASE: ${{ needs.meta.outputs.prerelease }}
         run: |
           set -euo pipefail
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "release $TAG already exists; refreshing assets"
-          else
-            args=(
-              --repo "$GITHUB_REPOSITORY"
-              --title "$TAG"
-              --notes "devenv $TAG. See CHANGELOG.md for details."
-              --verify-tag
-            )
-            if [ "$PRERELEASE" = "true" ]; then
-              args+=(--prerelease)
+            existing="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length')"
+            if [ "$existing" != "0" ]; then
+              echo "error: release $TAG already has $existing asset(s); refusing to overwrite" >&2
+              exit 1
             fi
-            gh release create "$TAG" "${args[@]}"
+          else
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" \
+              --notes "devenv $TAG. See CHANGELOG.md for details." \
+              --verify-tag
           fi
           gh release upload "$TAG" \
             artifacts/devenv-v*.tar.gz \
             artifacts/devenv-v*.tar.gz.sha256 \
-            --clobber --repo "$GITHUB_REPOSITORY"
+            --repo "$GITHUB_REPOSITORY"

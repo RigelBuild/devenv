@@ -1,7 +1,8 @@
 name: "Release Binaries Eval"
 
-# Evaluates the release target without compiling it. A broken flake output
-# fails here on the PR, not on the tag that would publish it.
+# Evaluates the release target for every published system without compiling
+# it. A broken flake output fails here on the PR, not on the tag that would
+# publish it.
 
 on:
   pull_request:
@@ -15,9 +16,13 @@ permissions:
 
 jobs:
   eval:
-    name: Eval devenv-static-unwrapped
-    runs-on: ubuntu-latest
+    name: Eval (${{ matrix.system }})
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        system: [x86_64-linux, aarch64-linux, aarch64-darwin]
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
@@ -26,4 +31,6 @@ jobs:
       # Evaluation only: `--raw .drvPath` reads the derivation path without
       # realising any output, so no source build runs.
       - name: Evaluate release target
-        run: nix eval --raw .#devenv-static-unwrapped.drvPath
+        env:
+          SYSTEM: ${{ matrix.system }}
+        run: nix eval --raw ".#packages.${SYSTEM}.devenv-static-unwrapped.drvPath"
