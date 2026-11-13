@@ -1,0 +1,216 @@
+name: "Release Binaries"
+
+# Publishes the devenv CLI as a static, relocatable binary per platform to a
+# GitHub Release for each version tag. Each build uses the flake output
+# devenv-static-unwrapped, which build.yml already exercises upstream.
+#
+# A published release is immutable: publish refuses to overwrite assets that
+# are already on it. Tarballs are not byte-reproducible, so a rebuild changes
+# every hash. Recover a half-published release by deleting it and re-running.
+#
+# Hosts consume these assets through a fork flake package. Its pinned hashes
+# can only exist after the first tag publishes the assets, so that package
+# lands in a follow-up change.
+
+on:
+  push:
+    tags:
+      - "v*-rigel.*"
+
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build a release for"
+        required: true
+        type: string
+
+concurrency:
+  group: release-binaries-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  meta:
+    name: Compute release metadata
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - id: tag
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            tag="$TAG_INPUT"
+          else
+            tag="$REF_NAME"
+          fi
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rigel\.[0-9]+$ ]] || { echo "error: tag must be vX.Y.Z-rigel.N, got: $tag" >&2; exit 1; }
+          {
+            echo "tag=${tag}"
+            echo "version=${tag#v}"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      # The binary reports the upstream base version, so the tag's base (before
+      # the -rigel.N fork suffix) must name the Cargo workspace version.
+      - name: Check tag base matches the workspace version
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          base="${VERSION%%-rigel.*}"
+          cargo_version="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          if [ "$cargo_version" != "$base" ]; then
+            echo "error: tag base $base does not match Cargo.toml version $cargo_version" >&2
+            exit 1
+          fi
+
+  build:
+    name: Build (${{ matrix.slug }})
+    needs: [meta]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - slug: darwin-arm64
+            runs-on: macos-15
+          - slug: linux-amd64
+            runs-on: ubuntu-24.04
+          - slug: linux-arm64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    # Cold builds of the custom Nix fork take hours. The devenv cachix
+    # substituter, pull-only as in rigel-ci.yml, keeps warm builds short.
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+
+      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+        with:
+          name: devenv
+
+      - name: Build devenv-static-unwrapped
+        run: nix build -L --show-trace .#devenv-static-unwrapped
+
+      # Relocatable means the binary needs nothing from the build host: no
+      # dynamic loader, no Nix store library, no Nix store rpath. The Linux
+      # build is static, so it has no interpreter and no DT_NEEDED entries.
+      # The macOS build may link only system libraries.
+      - name: Check the binary is relocatable
+        run: |
+          set -euo pipefail
+          bin="result/bin/devenv"
+          fail() { echo "error: $*" >&2; exit 1; }
+          case "$(uname -s)" in
+            Linux)
+              phdrs="$(readelf -lW "$bin")"
+              dyn="$(readelf -dW "$bin")"
+              if grep -q 'INTERP' <<<"$phdrs"; then fail "binary has a PT_INTERP loader"; fi
+              if grep -q 'NEEDED' <<<"$dyn"; then fail "binary has DT_NEEDED entries"; fi
+              if grep -q '/nix/store' <<<"$dyn"; then fail "binary has a /nix/store RUNPATH"; fi
+              ;;
+            Darwin)
+              deps="$(otool -L "$bin")"
+              loads="$(otool -l "$bin")"
+              while IFS= read -r dep; do
+                case "$dep" in
+                  *:) continue ;; # the `otool -L` header line names the binary
+                  "") continue ;;
+                esac
+                path="$(sed 's/^[[:space:]]*//; s/ (.*//' <<<"$dep")"
+                case "$path" in
+                  /usr/lib/*|/System/*) ;;
+                  *) fail "dynamic dependency outside /usr/lib and /System: $path" ;;
+                esac
+              done <<<"$deps"
+              if grep -q '/nix/store' <<<"$loads"; then fail "binary load commands reference /nix/store"; fi
+              if grep -qE '@rpath|@loader_path' <<<"$loads"; then fail "binary uses @rpath or @loader_path"; fi
+              ;;
+            *) fail "unsupported build host: $(uname -s)" ;;
+          esac
+
+      # Smoke-run the binary before packing, so a broken build never reaches
+      # a release. This runs on a host with /nix/store, so it does not prove
+      # relocatability; the check above does.
+      - name: Stage, smoke-test, and pack
+        env:
+          VER: ${{ needs.meta.outputs.version }}
+          SLUG: ${{ matrix.slug }}
+        run: |
+          set -euo pipefail
+          name="devenv-v${VER}-${SLUG}"
+          stage="$RUNNER_TEMP/$name"
+          mkdir -p "$stage"
+          cp -L result/bin/devenv "$stage/devenv"
+          chmod 0755 "$stage/devenv"
+          cp LICENSE "$stage/"
+          banner="$("$stage/devenv" version)"
+          case "$banner" in
+            "devenv "*) ;;
+            *) echo "error: unexpected version output: $banner" >&2; exit 1 ;;
+          esac
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/$name.tar.gz" "$name"
+          (cd "$RUNNER_TEMP" && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: devenv-${{ matrix.slug }}
+          path: |
+            ${{ runner.temp }}/devenv-v*.tar.gz
+            ${{ runner.temp }}/devenv-v*.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: [meta, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: devenv-*
+          path: artifacts
+          merge-multiple: true
+
+      # Never overwrite: an existing asset means this tag was already
+      # published, and its bytes must not change under consumers.
+      - name: Publish release assets without overwriting
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            existing="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length')"
+            if [ "$existing" != "0" ]; then
+              echo "error: release $TAG already has $existing asset(s); refusing to overwrite" >&2
+              exit 1
+            fi
+          else
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" \
+              --notes "devenv $TAG. See CHANGELOG.md for details." \
+              --verify-tag
+          fi
+          gh release upload "$TAG" \
+            artifacts/devenv-v*.tar.gz \
+            artifacts/devenv-v*.tar.gz.sha256 \
+            --repo "$GITHUB_REPOSITORY"

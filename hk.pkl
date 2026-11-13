@@ -1,0 +1,15 @@
+// Git hooks managed by hk (https://hk.jdx.dev).
+amends "package://github.com/jdx/hk/releases/download/v2.11.1/hk@2.11.1#/Config.pkl"
+
+default_branch = "rigel-release"
+
+hooks {
+    ["pre-push"] {
+        steps {
+            ["release-workflows-lint"] = new Step {
+                glob = List(".github/workflows/release-binaries*.yml")
+                check = "nix shell nixpkgs#actionlint --command actionlint {{files}}"
+            }
+        }
+    }
+}
