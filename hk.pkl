@@ -7,8 +7,12 @@ hooks {
     ["pre-push"] {
         steps {
             ["release-workflows-lint"] = new Step {
-                glob = List(".github/workflows/release-binaries*.yml")
+                glob = List(".github/workflows/release-binaries*.yml", ".github/workflows/release-tag.yaml")
                 check = "nix shell nixpkgs#actionlint --command actionlint {{files}}"
+            }
+            ["release-tag-test"] = new Step {
+                glob = List(".github/scripts/release-tag*.sh", ".github/workflows/release-tag.yaml", ".github/rigel-version")
+                check = "nix shell nixpkgs#yq-go nixpkgs#git --command bash .github/scripts/release-tag.test.sh"
             }
         }
     }
