@@ -75,6 +75,11 @@
         "aarch64-linux"
         "aarch64-darwin"
       ];
+      releaseSystems = [
+        "x86_64-linux"
+        "aarch64-linux"
+        "aarch64-darwin"
+      ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
     in
     {
@@ -253,6 +258,26 @@
             inherit pkgs;
             inherit (self.packages.${system}) devenv;
           };
+        }
+        // (
+          if builtins.elem system releaseSystems then
+            {
+              devenv-release =
+                (import inputs.nixpkgs.inputs.nixpkgs-src { inherit system; }).callPackage ./nix/release-binary.nix
+                  { inherit system; };
+            }
+          else
+            { }
+        )
+      );
+
+      checks = nixpkgs.lib.genAttrs releaseSystems (
+        system:
+        let
+          pkgs = import inputs.nixpkgs.inputs.nixpkgs-src { inherit system; };
+        in
+        {
+          devenv-release = pkgs.callPackage ./nix/release-binary.nix { inherit system; };
         }
       );
 
